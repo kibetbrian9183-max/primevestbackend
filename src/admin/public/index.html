@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PrimeVest Admin</title>
+<link rel="stylesheet" href="admin.css" />
+</head>
+<body>
+
+<!-- ===================== LOGIN VIEW ===================== -->
+<div id="loginView" class="login-screen">
+  <div class="login-card">
+    <div class="login-logo">P</div>
+    <h1>PrimeVest Admin</h1>
+    <p class="muted">Sign in to manage users, deposits, and withdrawals.</p>
+    <form id="loginForm">
+      <label>Admin email</label>
+      <input type="email" id="loginEmail" autocomplete="username" required />
+      <label>Password</label>
+      <input type="password" id="loginPassword" autocomplete="current-password" required />
+      <div id="loginError" class="error-box" hidden></div>
+      <button type="submit">Log in</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===================== DASHBOARD VIEW ===================== -->
+<div id="appView" class="app-shell" hidden>
+  <aside class="sidebar">
+    <div class="sidebar-logo"><span class="logo-badge">P</span> PrimeVest Admin</div>
+    <nav>
+      <button class="nav-btn active" data-view="overview">Overview</button>
+      <button class="nav-btn" data-view="users">Users</button>
+      <button class="nav-btn" data-view="withdrawals">Withdrawals</button>
+      <button class="nav-btn" data-view="deposits">Deposits</button>
+      <button class="nav-btn" data-view="notifications">Notifications</button>
+      <button class="nav-btn" data-view="settings">Settings</button>
+    </nav>
+    <button id="logoutBtn" class="logout-btn">Log out</button>
+  </aside>
+
+  <main class="content">
+    <!-- Overview -->
+    <section id="view-overview" class="view">
+      <h2>Overview</h2>
+      <div id="statCards" class="stat-grid"></div>
+    </section>
+
+    <!-- Users -->
+    <section id="view-users" class="view" hidden>
+      <div class="view-header">
+        <h2>Users</h2>
+        <input id="userSearch" placeholder="Search by name or email…" />
+      </div>
+      <div class="table-wrap"><table id="usersTable"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <!-- User detail modal -->
+    <div id="userModal" class="modal" hidden>
+      <div class="modal-card">
+        <button class="modal-close" id="closeUserModal">&times;</button>
+        <div id="userModalBody"></div>
+      </div>
+    </div>
+
+    <!-- Withdrawals -->
+    <section id="view-withdrawals" class="view" hidden>
+      <h2>Withdrawal requests</h2>
+      <p class="muted">Pay the user via M-Pesa yourself, then mark it paid here so it updates on their side.</p>
+      <div class="table-wrap"><table id="withdrawalsTable"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <!-- Deposits -->
+    <section id="view-deposits" class="view" hidden>
+      <h2>Deposits</h2>
+      <div class="table-wrap"><table id="depositsTable"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <!-- Notifications -->
+    <section id="view-notifications" class="view" hidden>
+      <h2>Send a notification</h2>
+      <form id="notifyForm" class="stacked-form">
+        <label>Recipient</label>
+        <select id="notifyTarget"><option value="">All users (broadcast)</option></select>
+        <label>Title</label>
+        <input id="notifyTitle" required />
+        <label>Message</label>
+        <textarea id="notifyBody" rows="3" required></textarea>
+        <button type="submit">Send</button>
+      </form>
+      <h3>Recent notifications</h3>
+      <div id="notifyList" class="list"></div>
+    </section>
+
+    <!-- Settings -->
+    <section id="view-settings" class="view" hidden>
+      <h2>Site settings</h2>
+      <form id="settingsForm" class="stacked-form">
+        <label>USD → KES rate</label>
+        <input id="setRate" type="number" step="0.01" />
+        <label>Minimum deposit (KES)</label>
+        <input id="setMinDeposit" type="number" />
+        <label>Minimum withdrawal (USD)</label>
+        <input id="setMinWithdrawal" type="number" step="0.01" />
+        <label>Payout rate (e.g. 1.952 = 95.2%)</label>
+        <input id="setPayoutRate" type="number" step="0.001" />
+        <label>Referral rate (e.g. 0.10 = 10%)</label>
+        <input id="setReferralRate" type="number" step="0.01" />
+        <label class="checkbox-row"><input id="setMaintenance" type="checkbox" /> Maintenance mode</label>
+        <button type="submit">Save settings</button>
+      </form>
+    </section>
+  </main>
+</div>
+
+<script src="admin.js"></script>
+</body>
+</html>
