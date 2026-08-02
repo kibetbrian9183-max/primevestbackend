@@ -16,6 +16,11 @@ const { errorHandler } = require("./middleware/errorHandler");
 
 const app = express();
 
+// Render (like most hosts) sits behind a reverse proxy, so the real
+// client IP arrives via X-Forwarded-For. Without this, express-rate-limit
+// throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every rate-limited request.
+app.set("trust proxy", 1);
+
 // The admin panel is served from this same origin, so it needs relaxed CSP
 // for its own inline bits to work; keep helmet's other protections on.
 app.use(helmet({ contentSecurityPolicy: false }));
