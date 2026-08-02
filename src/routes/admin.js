@@ -25,12 +25,12 @@ router.post("/login", async (req, res) => {
   }
 
   const token = signAdminToken(email.toLowerCase());
-  setAdminCookie(res, token);
+  setAdminCookie(req, res, token);
   res.json({ ok: true, email: email.toLowerCase() });
 });
 
 router.post("/logout", requireAdmin, (req, res) => {
-  clearAdminCookie(res);
+  clearAdminCookie(req, res);
   res.json({ ok: true });
 });
 
