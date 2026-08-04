@@ -3,6 +3,7 @@ const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const Trade = require("../models/Trade");
 const Payment = require("../models/Payment");
+const IdentityDocument = require("../models/IdentityDocument");
 const Notification = require("../models/Notification");
 const Settings = require("../models/Settings");
 const { getSettings } = require("../models/Settings");
@@ -93,8 +94,50 @@ router.delete("/users/:id", requireAdmin, async (req, res, next) => {
       Trade.deleteMany({ user: user._id }),
       Payment.deleteMany({ user: user._id }),
       Notification.deleteMany({ user: user._id }),
+      IdentityDocument.deleteMany({ user: user._id }),
     ]);
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Identity verification (KYC)
+// ---------------------------------------------------------------------------
+
+/** Lists which of the three documents this user has on file (no image data). */
+router.get("/users/:id/documents", requireAdmin, async (req, res, next) => {
+  try {
+    const docs = await IdentityDocument.find({ user: req.params.id }).select("kind mimeType size createdAt");
+    res.json({ documents: docs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Streams one document's raw image/PDF bytes for the admin to view inline. */
+router.get("/users/:id/documents/:kind", requireAdmin, async (req, res, next) => {
+  try {
+    const doc = await IdentityDocument.findOne({ user: req.params.id, kind: req.params.kind });
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+    res.set("Content-Type", doc.mimeType);
+    res.send(Buffer.from(doc.data, "base64"));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Approves or rejects a pending identity verification. */
+router.patch("/users/:id/identity", requireAdmin, async (req, res, next) => {
+  try {
+    const { decision } = req.body || {}; // "verified" | "unverified"
+    if (!["verified", "unverified"].includes(decision)) {
+      return res.status(400).json({ error: "decision must be 'verified' or 'unverified'" });
+    }
+    const user = await User.findByIdAndUpdate(req.params.id, { identityStatus: decision }, { new: true });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ user });
   } catch (err) {
     next(err);
   }
