@@ -24,7 +24,9 @@ app.set("trust proxy", 1);
 // The admin panel is served from this same origin, so it needs relaxed CSP
 // for its own inline bits to work; keep helmet's other protections on.
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json());
+// Raised from the 100kb default to fit base64-encoded identity document
+// uploads (each file up to 10MB raw becomes ~14MB once base64-encoded).
+app.use(express.json({ limit: "45mb" }));
 app.use(cookieParser());
 app.use(
   cors({
