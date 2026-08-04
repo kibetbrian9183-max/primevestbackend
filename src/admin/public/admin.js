@@ -50,9 +50,25 @@ function showApp() {
 $("#loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("#loginError").hidden = true;
+  const btn = e.target.querySelector("button[type=submit]");
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Logging in…";
+
+  // Render's free tier can take 50+ seconds to wake from idle — show
+  // that explicitly instead of leaving the button looking frozen.
+  const slowNotice = setTimeout(() => {
+    btn.textContent = "Still waking up the server… hang tight";
+  }, 6000);
+
+  // Don't hang forever if something is actually wrong.
+  const controller = new AbortController();
+  const hardTimeout = setTimeout(() => controller.abort(), 60000);
+
   try {
     await api("/login", {
       method: "POST",
+      signal: controller.signal,
       body: JSON.stringify({
         email: $("#loginEmail").value,
         password: $("#loginPassword").value,
@@ -60,8 +76,16 @@ $("#loginForm").addEventListener("submit", async (e) => {
     });
     showApp();
   } catch (err) {
-    $("#loginError").textContent = err.message;
+    $("#loginError").textContent =
+      err.name === "AbortError"
+        ? "The server took too long to respond. Wait a few seconds and try again."
+        : err.message;
     $("#loginError").hidden = false;
+  } finally {
+    clearTimeout(slowNotice);
+    clearTimeout(hardTimeout);
+    btn.disabled = false;
+    btn.textContent = originalLabel;
   }
 });
 
@@ -137,6 +161,44 @@ async function openUser(id) {
   const { user, trades, payments } = await api(`/users/${id}`);
   const won = trades.filter((t) => t.status === "won").length;
   const lost = trades.filter((t) => t.status === "lost").length;
+  const idt = user.identity || {};
+
+  let docsHtml = "";
+  if (user.identityStatus !== "unverified") {
+    const { documents } = await api(`/users/${id}/documents`);
+    const thumb = (kind, label) => {
+      const has = documents.some((d) => d.kind === kind);
+      return has
+        ? `<a href="/api/admin/users/${id}/documents/${kind}" target="_blank" style="display:block">
+             <img src="/api/admin/users/${id}/documents/${kind}" alt="${label}"
+                  style="width:100%;border-radius:10px;border:1px solid var(--border);object-fit:cover;height:110px" />
+             <div class="meta" style="text-align:center;margin-top:4px">${label}</div>
+           </a>`
+        : `<div class="empty-note" style="padding:12px">${label} not uploaded</div>`;
+    };
+    docsHtml = `
+      <h3>Identity verification</h3>
+      <div class="detail-row"><span>Legal name</span><span>${idt.firstName || ""} ${idt.middleName || ""} ${idt.lastName || ""}</span></div>
+      <div class="detail-row"><span>Date of birth</span><span>${idt.dateOfBirth || "—"}</span></div>
+      <div class="detail-row"><span>ID type / number</span><span>${idt.idType || "—"} · ${idt.idNumber || "—"}</span></div>
+      <div class="detail-row"><span>Issuing country</span><span>${idt.issuingCountry || "—"}</span></div>
+      <div class="detail-row"><span>Contact</span><span>${idt.contactEmail || "—"} · ${idt.contactPhone || "—"}</span></div>
+      <div class="detail-row"><span>Address</span><span>${[idt.addressLine, idt.city, idt.stateCounty, idt.postalCode, idt.country].filter(Boolean).join(", ") || "—"}</span></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin:14px 0">
+        ${thumb("id_front", "ID Front")}
+        ${thumb("id_back", "ID Back")}
+        ${thumb("selfie", "Selfie w/ ID")}
+      </div>
+      ${
+        user.identityStatus === "pending"
+          ? `<div class="row-actions" style="margin-bottom:20px">
+               <button class="btn-sm pay" onclick="decideIdentity('${id}','verified')">Approve identity</button>
+               <button class="btn-sm reject" onclick="decideIdentity('${id}','unverified')">Reject</button>
+             </div>`
+          : ""
+      }
+    `;
+  }
 
   $("#userModalBody").innerHTML = `
     <h2 style="margin-top:0">${user.name || "Unnamed"}</h2>
@@ -145,8 +207,10 @@ async function openUser(id) {
     <div class="detail-row"><span>Demo balance</span><span>$${fmtMoney(user.demoBalance)}</span></div>
     <div class="detail-row"><span>Real balance</span><span>$${fmtMoney(user.realBalance)}</span></div>
     <div class="detail-row"><span>Trades</span><span>${trades.length} (${won}W / ${lost}L)</span></div>
-    <div class="detail-row"><span>Identity</span><span>${user.identityStatus}</span></div>
+    <div class="detail-row"><span>Identity</span><span>${pill(user.identityStatus)}</span></div>
     <div class="detail-row"><span>Joined</span><span>${fmtDate(user.createdAt)}</span></div>
+
+    ${docsHtml}
 
     <h3>Recent payments</h3>
     ${
@@ -169,6 +233,11 @@ async function openUser(id) {
     </div>
   `;
   $("#userModal").hidden = false;
+}
+
+async function decideIdentity(id, decision) {
+  await api(`/users/${id}/identity`, { method: "PATCH", body: JSON.stringify({ decision }) });
+  openUser(id);
 }
 
 $("#closeUserModal").addEventListener("click", () => ($("#userModal").hidden = true));
