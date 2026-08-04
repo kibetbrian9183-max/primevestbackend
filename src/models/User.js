@@ -13,6 +13,23 @@ const userSchema = new mongoose.Schema(
 
     twoFactorEnabled: { type: Boolean, default: false },
     identityStatus: { type: String, enum: ["unverified", "pending", "verified"], default: "unverified" },
+    identity: {
+      firstName: String,
+      lastName: String,
+      contactEmail: String,
+      contactPhone: String,
+      middleName: String,
+      dateOfBirth: String, // stored as YYYY-MM-DD
+      idType: String, // "National ID" | "Passport" | "Driver's License" | ...
+      idNumber: String,
+      issuingCountry: String,
+      addressLine: String,
+      city: String,
+      stateCounty: String,
+      postalCode: String,
+      country: String,
+      submittedAt: Date,
+    },
 
     status: { type: String, enum: ["active", "suspended"], default: "active" },
   },
