@@ -1,4 +1,3 @@
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -21,8 +20,9 @@ const app = express();
 // throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every rate-limited request.
 app.set("trust proxy", 1);
 
-// The admin panel is served from this same origin, so it needs relaxed CSP
-// for its own inline bits to work; keep helmet's other protections on.
+// This is a pure JSON API now (the admin panel deploys separately on
+// Vercel), so CSP's page-level protections don't really apply — keep
+// helmet's other headers on regardless.
 app.use(helmet({ contentSecurityPolicy: false }));
 // Raised from the 100kb default to fit base64-encoded identity document
 // uploads (each file up to 10MB raw becomes ~14MB once base64-encoded).
@@ -56,9 +56,6 @@ app.use("/api/trades", tradeRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/admin", adminRoutes);
-
-// Admin dashboard — plain static files, no build step.
-app.use("/admin", express.static(path.join(__dirname, "admin/public")));
 
 app.use(errorHandler);
 
