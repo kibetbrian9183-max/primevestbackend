@@ -1,6 +1,9 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const speakeasy = require("speakeasy");
+const qrcode = require("qrcode");
 const User = require("../models/User");
 const IdentityDocument = require("../models/IdentityDocument");
 const { signUserToken, requireAuth } = require("../middleware/auth");
@@ -63,6 +66,51 @@ router.post("/login", async (req, res, next) => {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Incorrect password" });
 
+    if (user.twoFactorEnabled) {
+      // Password checks out, but don't issue a real session token yet — the
+      // client still has to prove it holds a valid TOTP code. This token is
+      // only good for that one purpose and expires quickly.
+      const preAuthToken = jwt.sign(
+        { preAuth: true, sub: user._id.toString() },
+        process.env.JWT_SECRET,
+        { expiresIn: "5m" }
+      );
+      return res.json({ requiresTwoFactor: true, preAuthToken });
+    }
+
+    const token = signUserToken(user);
+    res.json({ token, user: publicUser(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/login/2fa", async (req, res, next) => {
+  try {
+    const { preAuthToken, code } = req.body || {};
+    if (!preAuthToken || !code) return res.status(400).json({ error: "Missing verification code" });
+
+    let payload;
+    try {
+      payload = jwt.verify(preAuthToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: "Login session expired — enter your password again" });
+    }
+    if (!payload.preAuth) return res.status(401).json({ error: "Invalid login session" });
+
+    const user = await User.findById(payload.sub);
+    if (!user || !user.twoFactorEnabled || !user.twoFactorSecret) {
+      return res.status(400).json({ error: "Two-factor authentication is not set up on this account" });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: user.twoFactorSecret,
+      encoding: "base32",
+      token: String(code).trim(),
+      window: 1, // allow the code from ±1 step (±30s) for clock drift
+    });
+    if (!verified) return res.status(401).json({ error: "Incorrect code — check the app and try again" });
+
     const token = signUserToken(user);
     res.json({ token, user: publicUser(user) });
   } catch (err) {
@@ -82,10 +130,9 @@ router.get("/me", requireAuth, async (req, res, next) => {
 
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
-    const { name, twoFactorEnabled } = req.body || {};
+    const { name } = req.body || {};
     const patch = {};
     if (typeof name === "string" && name.trim()) patch.name = name.trim();
-    if (typeof twoFactorEnabled === "boolean") patch.twoFactorEnabled = twoFactorEnabled;
 
     const user = await User.findByIdAndUpdate(req.userId, patch, { new: true });
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -112,6 +159,87 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
     user.passwordHash = await bcrypt.hash(newPassword, 10);
     await user.save();
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Two-factor authentication (TOTP — Google Authenticator compatible)
+// ---------------------------------------------------------------------------
+
+/** Starts setup: generates a secret and returns a QR code to scan. Does NOT enable 2FA yet — that only happens once the user proves they can generate a valid code. */
+router.post("/me/2fa/setup", requireAuth, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.twoFactorEnabled) return res.status(400).json({ error: "2FA is already enabled" });
+
+    const secret = speakeasy.generateSecret({
+      name: `PrimeVest (${user.email})`,
+      length: 20,
+    });
+
+    user.twoFactorPendingSecret = secret.base32;
+    await user.save();
+
+    const qrCodeDataUrl = await qrcode.toDataURL(secret.otpauth_url);
+
+    res.json({ secret: secret.base32, qrCodeDataUrl });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Confirms setup: only flips twoFactorEnabled on once a real code checks out. */
+router.post("/me/2fa/verify", requireAuth, async (req, res, next) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: "Enter the 6-digit code" });
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.twoFactorPendingSecret) {
+      return res.status(400).json({ error: "Start setup again before verifying" });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: user.twoFactorPendingSecret,
+      encoding: "base32",
+      token: String(code).trim(),
+      window: 1,
+    });
+    if (!verified) return res.status(401).json({ error: "Incorrect code — check the app and try again" });
+
+    user.twoFactorSecret = user.twoFactorPendingSecret;
+    user.twoFactorPendingSecret = null;
+    user.twoFactorEnabled = true;
+    await user.save();
+
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Disabling requires the current password — not just a click — since this removes a security layer. */
+router.post("/me/2fa/disable", requireAuth, async (req, res, next) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: "Enter your password to disable 2FA" });
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: "Incorrect password" });
+
+    user.twoFactorEnabled = false;
+    user.twoFactorSecret = null;
+    user.twoFactorPendingSecret = null;
+    await user.save();
+
+    res.json({ user: publicUser(user) });
   } catch (err) {
     next(err);
   }
