@@ -12,6 +12,8 @@ const userSchema = new mongoose.Schema(
     realBalance: { type: Number, default: 0 },
 
     twoFactorEnabled: { type: Boolean, default: false },
+    twoFactorSecret: { type: String, default: null }, // base32 TOTP secret, set once confirmed
+    twoFactorPendingSecret: { type: String, default: null }, // awaiting verification during setup
     identityStatus: { type: String, enum: ["unverified", "pending", "verified"], default: "unverified" },
     identity: {
       firstName: String,
@@ -40,6 +42,8 @@ const userSchema = new mongoose.Schema(
 userSchema.set("toJSON", {
   transform: (doc, ret) => {
     delete ret.passwordHash;
+    delete ret.twoFactorSecret;
+    delete ret.twoFactorPendingSecret;
     return ret;
   },
 });
