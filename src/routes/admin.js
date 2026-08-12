@@ -8,6 +8,7 @@ const Notification = require("../models/Notification");
 const Settings = require("../models/Settings");
 const { getSettings } = require("../models/Settings");
 const { signAdminToken, setAdminCookie, clearAdminCookie, requireAdmin } = require("../middleware/adminAuth");
+const { sendSms } = require("../utils/smartpaySms");
 
 const router = express.Router();
 
@@ -175,6 +176,13 @@ router.patch("/payments/:id/mark-paid", requireAdmin, async (req, res, next) => 
     payment.processedAt = new Date();
     if (req.body?.note) payment.adminNote = req.body.note;
     await payment.save();
+
+    // Best-effort — an SMS hiccup shouldn't block the admin from completing
+    // the payout, so this doesn't throw. sendSms logs failures internally.
+    sendSms(
+      payment.phone,
+      `Congratulations! 🎉\n\nYour withdrawal of KSh ${Number(payment.amountKes).toLocaleString()} has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
+    );
 
     res.json({ payment });
   } catch (err) {
