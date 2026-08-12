@@ -8,6 +8,7 @@ const { requireAuth } = require("../middleware/auth");
 const User = require("../models/User");
 const Payment = require("../models/Payment");
 const { getSettings } = require("../models/Settings");
+const { sendSms } = require("../utils/smartpaySms");
 
 const router = express.Router();
 
@@ -150,6 +151,14 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       reference,
       status: "pending",
     });
+
+    // Fire-and-forget: confirm receipt immediately, before an admin has
+    // touched this. Never blocks or fails the withdrawal itself if the
+    // SMS gateway hiccups.
+    sendSms(
+      user.phone,
+      `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
+    );
 
     res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
   } catch (err) {
