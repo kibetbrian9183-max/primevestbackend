@@ -28,5 +28,10 @@ module.exports = {
     stkCallbackUrl: required("MPESA_STK_CALLBACK_URL"),
   },
 
+  // The single wallet address deposits are shown to send USDT to. Crypto
+  // deposits/withdrawals aren't chain-monitored — an admin manually
+  // confirms them in the dashboard, same as M-Pesa withdrawals.
+  usdtTrc20Address: process.env.DEPOSIT_USDT_ADDRESS || "",
+
   corsOrigin: (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean),
 };
