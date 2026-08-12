@@ -109,25 +109,29 @@ router.get("/deposit/status/:reference", requireAuth, async (req, res, next) => 
 
 /**
  * POST /api/payments/withdraw
- * Body: { phone, amountUsd }
+ * Body: { amountUsd }
+ * Payouts always go to the phone number the user registered at signup —
+ * never a client-supplied number — so a compromised session can't be used
+ * to redirect a withdrawal to an attacker's own M-Pesa line.
  * No live B2C payout is wired up — this validates against the real
  * balance, deducts it immediately, and records a pending withdrawal
  * for an admin to disburse manually and mark paid.
  */
 router.post("/withdraw", requireAuth, async (req, res, next) => {
   try {
-    const { phone, amountUsd } = req.body || {};
-    const msisdn = normalizeMsisdn(phone);
+    const { amountUsd } = req.body || {};
     const amt = Number(amountUsd);
 
     const settings = await getSettings();
-    if (!msisdn) return res.status(400).json({ error: "Invalid phone number" });
     if (!amt || amt < settings.minWithdrawalUsd) {
       return res.status(400).json({ error: `Minimum withdrawal is $${settings.minWithdrawalUsd}` });
     }
 
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.phone) {
+      return res.status(400).json({ error: "Add a phone number to your account in Settings before withdrawing" });
+    }
     if (user.realBalance <= 0) return res.status(400).json({ error: "Insufficient balance" });
     if (amt > user.realBalance) return res.status(400).json({ error: "Insufficient balance for this amount" });
 
@@ -142,7 +146,7 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       type: "withdrawal",
       amountKes,
       usdAmount: amt,
-      phone: msisdn,
+      phone: user.phone,
       reference,
       status: "pending",
     });
