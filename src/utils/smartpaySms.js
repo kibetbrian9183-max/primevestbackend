@@ -1,10 +1,10 @@
 const axios = require("axios");
 
-const SMARTPAY_SMS_URL = "https://api.smartpaypesa.com/v1/sms/";
+const SMARTPAY_SMS_URL = "https://api.smartpaypesa.com/v1/sms/index.php";
 
 /**
  * Sends a single SMS via the SmartPay SMS API.
- * Docs: POST https://api.smartpaypesa.com/v1/sms/  (header: X-API-Key)
+ *   GET https://api.smartpaypesa.com/v1/sms/index.php?apikey=...&phone=...&text=...
  * Accepts phone in 07XX / 01XX / 254XX format — no need to normalize first.
  *
  * Never throws on a delivery failure by default (SMS is a side effect —
@@ -21,17 +21,14 @@ async function sendSms(phone, message, { throwOnError = false } = {}) {
   }
 
   try {
-    const { data } = await axios.post(
-      SMARTPAY_SMS_URL,
-      { phone, message },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-API-Key": apiKey,
-        },
-        timeout: 10000,
-      }
-    );
+    const { data } = await axios.get(SMARTPAY_SMS_URL, {
+      params: {
+        apikey: apiKey,
+        phone,
+        text: message,
+      },
+      timeout: 10000,
+    });
     return data;
   } catch (err) {
     const detail = err.response?.data || err.message;
