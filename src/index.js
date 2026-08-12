@@ -47,6 +47,16 @@ app.use("/api/payments/withdraw", initiateLimiter);
 app.use("/api/auth/login", initiateLimiter);
 app.use("/api/admin/login", initiateLimiter);
 
+// Tighter limit on OTP requests — each one costs an SMS credit.
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/auth/forgot-password", otpLimiter);
+app.use("/api/auth/verify-reset-otp", otpLimiter);
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, env: config.env });
 });
