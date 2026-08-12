@@ -12,6 +12,24 @@ const { sendSms } = require("../utils/smartpaySms");
 
 const router = express.Router();
 
+// Basic TRC20 (Tron) address shape check — starts with T, 34 base58 chars.
+const TRC20_ADDRESS_RE = /^T[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+/** Public config the deposit/withdraw screens need — the receiving address and current rates. */
+router.get("/config", requireAuth, async (req, res, next) => {
+  try {
+    const settings = await getSettings();
+    res.json({
+      usdtTrc20Address: config.usdtTrc20Address,
+      usdKesRate: settings.usdKesRate,
+      minDepositKes: settings.minDepositKes,
+      minWithdrawalUsd: settings.minWithdrawalUsd,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /**
  * POST /api/payments/deposit
  * Body: { phone, amountKes }
@@ -109,8 +127,43 @@ router.get("/deposit/status/:reference", requireAuth, async (req, res, next) => 
 });
 
 /**
- * POST /api/payments/withdraw
- * Body: { amountUsd }
+ * POST /api/payments/deposit/crypto
+ * Body: { amountUsd, txHash? }
+ * Records a pending deposit against our fixed USDT (TRC20) address. We
+ * don't watch the chain, so this doesn't credit anything by itself — an
+ * admin confirms it manually once they see the funds land, same idea as
+ * a manually-disbursed M-Pesa withdrawal but in reverse.
+ */
+router.post("/deposit/crypto", requireAuth, async (req, res, next) => {
+  try {
+    if (!config.usdtTrc20Address) return res.status(503).json({ error: "Crypto deposits aren't set up yet" });
+
+    const amt = Number(req.body?.amountUsd);
+    if (!amt || amt <= 0) return res.status(400).json({ error: "Enter an amount" });
+
+    const settings = await getSettings();
+    const amountKes = Math.round(amt * settings.usdKesRate);
+    const reference = `DEP-C-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+
+    const payment = await Payment.create({
+      user: req.userId,
+      type: "deposit",
+      method: "usdt_trc20",
+      amountKes,
+      usdAmount: amt,
+      walletAddress: config.usdtTrc20Address,
+      txHash: (req.body?.txHash || "").trim(),
+      reference,
+      status: "pending",
+    });
+
+    res.status(201).json({ reference: payment.reference, address: config.usdtTrc20Address });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
  * Payouts always go to the phone number the user registered at signup —
  * never a client-supplied number — so a compromised session can't be used
  * to redirect a withdrawal to an attacker's own M-Pesa line.
@@ -159,6 +212,63 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       user.phone,
       `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
     );
+
+    res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/payments/withdraw/crypto
+ * Body: { amountUsd, walletAddress }
+ * Unlike M-Pesa withdrawals, the destination here is inherently
+ * user-supplied (their own wallet) — there's no "registered address" to
+ * pin it to. Same manual-review model otherwise: balance is deducted
+ * immediately, an admin sends the actual payout and marks it paid.
+ */
+router.post("/withdraw/crypto", requireAuth, async (req, res, next) => {
+  try {
+    const amt = Number(req.body?.amountUsd);
+    const walletAddress = (req.body?.walletAddress || "").trim();
+
+    const settings = await getSettings();
+    if (!amt || amt < settings.minWithdrawalUsd) {
+      return res.status(400).json({ error: `Minimum withdrawal is $${settings.minWithdrawalUsd}` });
+    }
+    if (!TRC20_ADDRESS_RE.test(walletAddress)) {
+      return res.status(400).json({ error: "Enter a valid TRC20 (USDT) wallet address" });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.realBalance <= 0) return res.status(400).json({ error: "Insufficient balance" });
+    if (amt > user.realBalance) return res.status(400).json({ error: "Insufficient balance for this amount" });
+
+    user.realBalance = Number((user.realBalance - amt).toFixed(2));
+    await user.save();
+
+    const amountKes = Math.round(amt * settings.usdKesRate);
+    const reference = `WD-C-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+
+    const payment = await Payment.create({
+      user: user._id,
+      type: "withdrawal",
+      method: "usdt_trc20",
+      amountKes,
+      usdAmount: amt,
+      walletAddress,
+      reference,
+      status: "pending",
+    });
+
+    // Best-effort — only if the account actually has a phone on file.
+    if (user.phone) {
+      sendSms(
+        user.phone,
+        `Congratulations! 🎉\n\nYour withdrawal of $${amt.toFixed(2)} USDT has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
+      );
+    }
 
     res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
   } catch (err) {
