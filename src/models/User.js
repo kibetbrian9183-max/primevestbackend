@@ -4,7 +4,7 @@ const userSchema = new mongoose.Schema(
   {
     name: { type: String, default: "" },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
-    phone: { type: String, required: true, unique: true, sparse: true, index: true }, // 254XXXXXXXXX — the registered line OTPs are sent to
+    phone: { type: String, unique: true, sparse: true, index: true, default: null }, // 254XXXXXXXXX — the registered line OTPs are sent to. Enforced as required at signup (routes/auth.js), NOT here — schema-level `required` would fail full-document validation on every .save() for pre-existing accounts that signed up before this field existed.
     passwordHash: { type: String, required: true },
     referralCode: { type: String, unique: true, sparse: true },
     referredBy: { type: String, default: null }, // referralCode of whoever referred this user
