@@ -7,11 +7,27 @@ const qrcode = require("qrcode");
 const User = require("../models/User");
 const IdentityDocument = require("../models/IdentityDocument");
 const { signUserToken, requireAuth } = require("../middleware/auth");
+const { normalizeMsisdn } = require("../utils/mpesaHelpers");
+const { sendSms } = require("../utils/smartpaySms");
 
 const router = express.Router();
 
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const RESET_TOKEN_TTL_MS = 10 * 60 * 1000;
+const MAX_OTP_ATTEMPTS = 5;
+
 function genReferralCode() {
   return crypto.randomBytes(5).toString("hex").toUpperCase().slice(0, 8);
+}
+
+function gen6DigitOtp() {
+  // crypto.randomInt is uniform, unlike Math.random() — matters for a code
+  // that gates account access.
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+}
+
+function hashToken(raw) {
+  return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
 function publicUser(user) {
@@ -19,6 +35,7 @@ function publicUser(user) {
     id: user._id,
     name: user.name,
     email: user.email,
+    phone: user.phone,
     referralCode: user.referralCode,
     demoBalance: user.demoBalance,
     realBalance: user.realBalance,
@@ -31,17 +48,24 @@ function publicUser(user) {
 
 router.post("/signup", async (req, res, next) => {
   try {
-    const { name, email, password, referredBy } = req.body || {};
+    const { name, email, phone, password, referredBy } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
     if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
-    if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+    const msisdn = normalizeMsisdn(phone);
+    if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+
+    const existingEmail = await User.findOne({ email: email.toLowerCase() });
+    if (existingEmail) return res.status(409).json({ error: "An account with this email already exists" });
+
+    const existingPhone = await User.findOne({ phone: msisdn });
+    if (existingPhone) return res.status(409).json({ error: "An account with this phone number already exists" });
 
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await User.create({
       name: name || "",
       email: email.toLowerCase(),
+      phone: msisdn,
       passwordHash,
       referralCode: genReferralCode(),
       referredBy: referredBy || null,
@@ -338,6 +362,116 @@ router.post("/me/verify-identity", requireAuth, async (req, res, next) => {
     );
 
     res.json({ user: publicUser(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Forgot password — SMS OTP flow
+//
+//   1. POST /forgot-password    { phone }              -> sends a 6-digit OTP by SMS
+//   2. POST /verify-reset-otp   { phone, otp }          -> returns a short-lived resetToken
+//   3. POST /reset-password     { resetToken, newPassword } -> sets the new password
+//
+// The OTP itself is never sent back in step 2's response, and step 3 only
+// accepts the one-time resetToken — never the OTP or the phone again — so a
+// leaked network log from step 1/2 can't be replayed once step 2 succeeds.
+// ---------------------------------------------------------------------------
+
+router.post("/forgot-password", async (req, res, next) => {
+  try {
+    const msisdn = normalizeMsisdn(req.body?.phone);
+    if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+
+    const user = await User.findOne({ phone: msisdn });
+
+    // Same response whether or not the number is registered — otherwise
+    // this endpoint becomes a way to enumerate which phone numbers have
+    // accounts. The SMS only actually goes out if we found someone.
+    if (user) {
+      const otp = gen6DigitOtp();
+      user.resetOtpHash = await bcrypt.hash(otp, 10);
+      user.resetOtpExpires = new Date(Date.now() + OTP_TTL_MS);
+      user.resetOtpAttempts = 0;
+      user.resetTokenHash = null;
+      user.resetTokenExpires = null;
+      await user.save();
+
+      await sendSms(
+        msisdn,
+        `Your PrimeVest password reset code is ${otp}. It expires in 10 minutes. If you didn't request this, ignore this message.`,
+        { throwOnError: true }
+      );
+    }
+
+    res.json({ message: "If that number is registered, we've sent a reset code." });
+  } catch (err) {
+    // sendSms throws if it's genuinely misconfigured/unreachable — surface
+    // that distinctly so the user isn't left staring at a code that never arrives.
+    if (err.message === "Could not send SMS — try again shortly" || err.message === "SMS service is not configured") {
+      return res.status(502).json({ error: "Couldn't send the reset code — try again shortly" });
+    }
+    next(err);
+  }
+});
+
+router.post("/verify-reset-otp", async (req, res, next) => {
+  try {
+    const msisdn = normalizeMsisdn(req.body?.phone);
+    const otp = String(req.body?.otp || "").trim();
+    if (!msisdn || !otp) return res.status(400).json({ error: "Phone and code are required" });
+
+    const user = await User.findOne({ phone: msisdn });
+    if (!user || !user.resetOtpHash || !user.resetOtpExpires) {
+      return res.status(400).json({ error: "Request a new code and try again" });
+    }
+    if (user.resetOtpExpires < new Date()) {
+      return res.status(400).json({ error: "That code has expired — request a new one" });
+    }
+    if (user.resetOtpAttempts >= MAX_OTP_ATTEMPTS) {
+      return res.status(429).json({ error: "Too many incorrect attempts — request a new code" });
+    }
+
+    const ok = await bcrypt.compare(otp, user.resetOtpHash);
+    if (!ok) {
+      user.resetOtpAttempts += 1;
+      await user.save();
+      return res.status(401).json({ error: "Incorrect code — check the SMS and try again" });
+    }
+
+    // OTP consumed — issue a one-time reset token for the final step.
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    user.resetTokenHash = hashToken(resetToken);
+    user.resetTokenExpires = new Date(Date.now() + RESET_TOKEN_TTL_MS);
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    user.resetOtpAttempts = 0;
+    await user.save();
+
+    res.json({ resetToken });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/reset-password", async (req, res, next) => {
+  try {
+    const { resetToken, newPassword } = req.body || {};
+    if (!resetToken || !newPassword) return res.status(400).json({ error: "Missing reset token or new password" });
+    if (newPassword.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters" });
+
+    const user = await User.findOne({ resetTokenHash: hashToken(resetToken) });
+    if (!user || !user.resetTokenExpires || user.resetTokenExpires < new Date()) {
+      return res.status(400).json({ error: "This reset link has expired — start over" });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    user.resetTokenHash = null;
+    user.resetTokenExpires = null;
+    await user.save();
+
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
