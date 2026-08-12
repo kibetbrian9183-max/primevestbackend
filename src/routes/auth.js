@@ -154,9 +154,17 @@ router.get("/me", requireAuth, async (req, res, next) => {
 
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
-    const { name } = req.body || {};
+    const { name, phone } = req.body || {};
     const patch = {};
     if (typeof name === "string" && name.trim()) patch.name = name.trim();
+
+    if (typeof phone === "string" && phone.trim()) {
+      const msisdn = normalizeMsisdn(phone);
+      if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+      const existing = await User.findOne({ phone: msisdn, _id: { $ne: req.userId } });
+      if (existing) return res.status(409).json({ error: "That phone number is already linked to another account" });
+      patch.phone = msisdn;
+    }
 
     const user = await User.findByIdAndUpdate(req.userId, patch, { new: true });
     if (!user) return res.status(404).json({ error: "User not found" });
