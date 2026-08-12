@@ -162,7 +162,7 @@ router.get("/payments", requireAdmin, async (req, res, next) => {
   }
 });
 
-/** Marks a pending withdrawal as paid after the admin has manually sent the M-Pesa payout. */
+/** Marks a pending withdrawal as paid after the admin has manually sent the payout (M-Pesa or crypto). */
 router.patch("/payments/:id/mark-paid", requireAdmin, async (req, res, next) => {
   try {
     const payment = await Payment.findById(req.params.id);
@@ -197,6 +197,61 @@ router.patch("/payments/:id/reject", requireAdmin, async (req, res, next) => {
     await payment.save();
 
     await User.findByIdAndUpdate(payment.user, { $inc: { realBalance: payment.usdAmount } });
+
+    res.json({ payment });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Confirms a pending crypto (USDT TRC20) deposit after the admin has
+ * checked the blockchain explorer for the incoming transfer, and credits
+ * the user's Real balance. M-Pesa deposits never hit this route — those
+ * confirm automatically via the Daraja callback.
+ */
+router.patch("/payments/:id/confirm-deposit", requireAdmin, async (req, res, next) => {
+  try {
+    const payment = await Payment.findById(req.params.id);
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (payment.type !== "deposit" || payment.method !== "usdt_trc20") {
+      return res.status(400).json({ error: "Only pending crypto deposits can be confirmed here" });
+    }
+    if (payment.status !== "pending") return res.status(400).json({ error: "This deposit is already processed" });
+
+    payment.status = "success";
+    payment.processedByAdmin = req.adminEmail;
+    payment.processedAt = new Date();
+    if (req.body?.txHash) payment.txHash = req.body.txHash;
+    if (req.body?.note) payment.adminNote = req.body.note;
+    await payment.save();
+
+    await User.findByIdAndUpdate(payment.user, { $inc: { realBalance: payment.usdAmount } });
+
+    res.json({ payment });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Rejects a pending crypto deposit (e.g. funds never arrived, wrong
+ * amount, suspected fraud) — no refund needed since nothing was credited.
+ */
+router.patch("/payments/:id/reject-deposit", requireAdmin, async (req, res, next) => {
+  try {
+    const payment = await Payment.findById(req.params.id);
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (payment.type !== "deposit" || payment.method !== "usdt_trc20") {
+      return res.status(400).json({ error: "Only pending crypto deposits can be rejected here" });
+    }
+    if (payment.status !== "pending") return res.status(400).json({ error: "This deposit is already processed" });
+
+    payment.status = "failed";
+    payment.processedByAdmin = req.adminEmail;
+    payment.processedAt = new Date();
+    payment.adminNote = req.body?.note || "Rejected by admin";
+    await payment.save();
 
     res.json({ payment });
   } catch (err) {
