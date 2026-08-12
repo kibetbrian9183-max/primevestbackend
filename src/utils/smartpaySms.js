@@ -1,10 +1,13 @@
 const axios = require("axios");
 
-const SMARTPAY_SMS_URL = "https://api.smartpaypesa.com/v1/sms/index.php";
+const SMARTPAY_SMS_URL = "https://api.smartpaypesa.com/v1/sms/";
+const SMARTPAY_BALANCE_URL = "https://api.smartpaypesa.com/v1/sms/balance";
 
 /**
  * Sends a single SMS via the SmartPay SMS API.
- *   GET https://api.smartpaypesa.com/v1/sms/index.php?apikey=...&phone=...&text=...
+ *   POST https://api.smartpaypesa.com/v1/sms/
+ *   Header: X-API-Key
+ *   Body:   { phone, message }
  * Accepts phone in 07XX / 01XX / 254XX format — no need to normalize first.
  *
  * Never throws on a delivery failure by default (SMS is a side effect —
@@ -21,14 +24,17 @@ async function sendSms(phone, message, { throwOnError = false } = {}) {
   }
 
   try {
-    const { data } = await axios.get(SMARTPAY_SMS_URL, {
-      params: {
-        apikey: apiKey,
-        phone,
-        text: message,
-      },
-      timeout: 10000,
-    });
+    const { data } = await axios.post(
+      SMARTPAY_SMS_URL,
+      { phone, message },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": apiKey,
+        },
+        timeout: 10000,
+      }
+    );
     return data;
   } catch (err) {
     const detail = err.response?.data || err.message;
@@ -38,4 +44,16 @@ async function sendSms(phone, message, { throwOnError = false } = {}) {
   }
 }
 
-module.exports = { sendSms };
+/** Checks remaining SMS credit balance — GET /v1/sms/balance */
+async function getSmsBalance() {
+  const apiKey = process.env.SMARTPAY_API_KEY;
+  if (!apiKey) throw new Error("SMS service is not configured");
+
+  const { data } = await axios.get(SMARTPAY_BALANCE_URL, {
+    headers: { "X-API-Key": apiKey },
+    timeout: 10000,
+  });
+  return data;
+}
+
+module.exports = { sendSms, getSmsBalance };
