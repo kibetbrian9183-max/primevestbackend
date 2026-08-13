@@ -7,8 +7,9 @@ const qrcode = require("qrcode");
 const User = require("../models/User");
 const IdentityDocument = require("../models/IdentityDocument");
 const { signUserToken, requireAuth } = require("../middleware/auth");
-const { normalizeMsisdn } = require("../utils/mpesaHelpers");
+const { normalizePhoneInternational } = require("../utils/mpesaHelpers");
 const { sendSms } = require("../utils/smartpaySms");
+const { sendEmail } = require("../utils/brevoEmail");
 
 const router = express.Router();
 
@@ -52,8 +53,12 @@ router.post("/signup", async (req, res, next) => {
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
     if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
 
-    const msisdn = normalizeMsisdn(phone);
-    if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+    const msisdn = normalizePhoneInternational(phone);
+    if (!msisdn) {
+      return res.status(400).json({
+        error: "Enter a valid phone number — a Kenyan number (07XX XXX XXX) or an international number with country code (e.g. +1 415 555 0100)",
+      });
+    }
 
     const existingEmail = await User.findOne({ email: email.toLowerCase() });
     if (existingEmail) return res.status(409).json({ error: "An account with this email already exists" });
@@ -159,8 +164,12 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (typeof name === "string" && name.trim()) patch.name = name.trim();
 
     if (typeof phone === "string" && phone.trim()) {
-      const msisdn = normalizeMsisdn(phone);
-      if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+      const msisdn = normalizePhoneInternational(phone);
+      if (!msisdn) {
+        return res.status(400).json({
+          error: "Enter a valid phone number — a Kenyan number (07XX XXX XXX) or an international number with country code (e.g. +1 415 555 0100)",
+        });
+      }
       const existing = await User.findOne({ phone: msisdn, _id: { $ne: req.userId } });
       if (existing) return res.status(409).json({ error: "That phone number is already linked to another account" });
       patch.phone = msisdn;
@@ -376,27 +385,62 @@ router.post("/me/verify-identity", requireAuth, async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Forgot password — SMS OTP flow
+// Forgot password — SMS or Email OTP flow
 //
-//   1. POST /forgot-password    { phone }              -> sends a 6-digit OTP by SMS
-//   2. POST /verify-reset-otp   { phone, otp }          -> returns a short-lived resetToken
-//   3. POST /reset-password     { resetToken, newPassword } -> sets the new password
+//   1. POST /forgot-password    { phone } OR { email }       -> sends a 6-digit OTP by SMS or email
+//   2. POST /verify-reset-otp   { phone, otp } OR { email, otp } -> returns a short-lived resetToken
+//   3. POST /reset-password     { resetToken, newPassword }   -> sets the new password
 //
 // The OTP itself is never sent back in step 2's response, and step 3 only
-// accepts the one-time resetToken — never the OTP or the phone again — so a
-// leaked network log from step 1/2 can't be replayed once step 2 succeeds.
+// accepts the one-time resetToken — never the OTP, phone, or email again —
+// so a leaked network log from step 1/2 can't be replayed once step 2 succeeds.
+// Both channels share the same resetOtp*/resetToken* fields on the user —
+// only one reset can be in flight at a time regardless of which channel
+// started it, which is fine since starting a new one always supersedes the old.
 // ---------------------------------------------------------------------------
+
+function otpEmailHtml(otp) {
+  return `
+    <div style="font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 420px; margin: 0 auto; padding: 32px 24px; background: #0B0F1A; color: #FFFFFF; border-radius: 16px;">
+      <div style="font-size: 15px; color: #8A94A6; margin-bottom: 4px;">PrimeVest</div>
+      <h1 style="font-size: 20px; margin: 0 0 16px;">Reset your password</h1>
+      <p style="font-size: 14px; color: #8A94A6; margin: 0 0 24px;">Use this code to reset your PrimeVest password. It expires in 10 minutes.</p>
+      <div style="font-size: 32px; font-weight: 700; letter-spacing: 6px; background: #1A1F2E; border-radius: 12px; padding: 16px; text-align: center; margin-bottom: 24px;">${otp}</div>
+      <p style="font-size: 12px; color: #8A94A6; margin: 0;">If you didn't request this, you can safely ignore this email — your password won't change unless this code is used.</p>
+    </div>
+  `;
+}
 
 router.post("/forgot-password", async (req, res, next) => {
   try {
-    const msisdn = normalizeMsisdn(req.body?.phone);
-    if (!msisdn) return res.status(400).json({ error: "Enter a valid Safaricom number" });
+    const rawPhone = req.body?.phone;
+    const rawEmail = req.body?.email;
 
-    const user = await User.findOne({ phone: msisdn });
+    let user = null;
+    let channel = null; // "sms" | "email"
+    let destination = null;
 
-    // Same response whether or not the number is registered — otherwise
-    // this endpoint becomes a way to enumerate which phone numbers have
-    // accounts. The SMS only actually goes out if we found someone.
+    if (rawEmail) {
+      const email = String(rawEmail).trim().toLowerCase();
+      if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address" });
+      user = await User.findOne({ email });
+      channel = "email";
+      destination = email;
+    } else {
+      const msisdn = normalizePhoneInternational(rawPhone);
+      if (!msisdn) {
+        return res.status(400).json({
+          error: "Enter a valid phone number, including country code if you're outside Kenya",
+        });
+      }
+      user = await User.findOne({ phone: msisdn });
+      channel = "sms";
+      destination = msisdn;
+    }
+
+    // Same response whether or not the account is registered — otherwise
+    // this endpoint becomes a way to enumerate accounts. The OTP only
+    // actually goes out if we found someone.
     if (user) {
       const otp = gen6DigitOtp();
       user.resetOtpHash = await bcrypt.hash(otp, 10);
@@ -406,18 +450,39 @@ router.post("/forgot-password", async (req, res, next) => {
       user.resetTokenExpires = null;
       await user.save();
 
-      await sendSms(
-        msisdn,
-        `Your PrimeVest password reset code is ${otp}. It expires in 10 minutes. If you didn't request this, ignore this message.`,
-        { throwOnError: true }
-      );
+      if (channel === "email") {
+        await sendEmail(destination, "Your PrimeVest password reset code", otpEmailHtml(otp), {
+          throwOnError: true,
+          toName: user.name || "",
+        });
+      } else {
+        // NOTE: SmartPay's documented format examples are Kenyan-only
+        // (07XX/01XX/254XX) — international SMS delivery isn't confirmed.
+        await sendSms(
+          destination,
+          `Your PrimeVest password reset code is ${otp}. It expires in 10 minutes. If you didn't request this, ignore this message.`,
+          { throwOnError: true }
+        );
+      }
     }
 
-    res.json({ message: "If that number is registered, we've sent a reset code." });
+    res.json({
+      message:
+        channel === "email"
+          ? "If that email is registered, we've sent a reset code."
+          : "If that number is registered, we've sent a reset code.",
+    });
   } catch (err) {
-    // sendSms throws if it's genuinely misconfigured/unreachable — surface
-    // that distinctly so the user isn't left staring at a code that never arrives.
-    if (err.message === "Could not send SMS — try again shortly" || err.message === "SMS service is not configured") {
+    // sendSms/sendEmail throw if genuinely misconfigured/unreachable —
+    // surface that distinctly rather than leaving the user staring at a
+    // code that will never arrive.
+    const transientErrors = [
+      "Could not send SMS — try again shortly",
+      "SMS service is not configured",
+      "Could not send the email — try again shortly",
+      "Email service is not configured",
+    ];
+    if (transientErrors.includes(err.message)) {
       return res.status(502).json({ error: "Couldn't send the reset code — try again shortly" });
     }
     next(err);
@@ -426,11 +491,19 @@ router.post("/forgot-password", async (req, res, next) => {
 
 router.post("/verify-reset-otp", async (req, res, next) => {
   try {
-    const msisdn = normalizeMsisdn(req.body?.phone);
     const otp = String(req.body?.otp || "").trim();
-    if (!msisdn || !otp) return res.status(400).json({ error: "Phone and code are required" });
+    if (!otp) return res.status(400).json({ error: "Enter the code" });
 
-    const user = await User.findOne({ phone: msisdn });
+    let user = null;
+    if (req.body?.email) {
+      const email = String(req.body.email).trim().toLowerCase();
+      user = await User.findOne({ email });
+    } else {
+      const msisdn = normalizePhoneInternational(req.body?.phone);
+      if (!msisdn) return res.status(400).json({ error: "Phone and code are required" });
+      user = await User.findOne({ phone: msisdn });
+    }
+
     if (!user || !user.resetOtpHash || !user.resetOtpExpires) {
       return res.status(400).json({ error: "Request a new code and try again" });
     }
@@ -445,7 +518,7 @@ router.post("/verify-reset-otp", async (req, res, next) => {
     if (!ok) {
       user.resetOtpAttempts += 1;
       await user.save();
-      return res.status(401).json({ error: "Incorrect code — check the SMS and try again" });
+      return res.status(401).json({ error: "Incorrect code — check and try again" });
     }
 
     // OTP consumed — issue a one-time reset token for the final step.
