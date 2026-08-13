@@ -11,6 +11,7 @@ const tradeRoutes = require("./routes/trades");
 const paymentRoutes = require("./routes/payments");
 const notificationRoutes = require("./routes/notifications");
 const adminRoutes = require("./routes/admin");
+const telegramRoutes = require("./routes/telegram");
 const { errorHandler } = require("./middleware/errorHandler");
 
 const app = express();
@@ -66,6 +67,7 @@ app.use("/api/trades", tradeRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/telegram", telegramRoutes);
 
 app.use(errorHandler);
 
