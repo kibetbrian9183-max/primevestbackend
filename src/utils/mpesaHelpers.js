@@ -35,4 +35,40 @@ function normalizeMsisdn(raw) {
   return n;
 }
 
-module.exports = { timestamp, stkPassword, normalizeMsisdn };
+/** True if this is already in the strict Kenyan 254(7|1)XXXXXXXX shape M-Pesa/SmartPay require. */
+function isKenyanMsisdn(phone) {
+  return /^254(7|1)\d{8}$/.test(String(phone || ""));
+}
+
+/**
+ * Normalizes ANY country's phone number for account-level use (signup,
+ * login, password-reset lookup) — not just Kenya. This app serves other
+ * countries too, and M-Pesa is only one of several deposit/withdraw rails
+ * (crypto works from anywhere), so the account phone itself can't be
+ * Kenya-only.
+ *
+ * - Input starting with "+": treated as international E.164, stored as
+ *   "+<digits>" (8-15 digits after the +).
+ * - Otherwise: tried against the Kenyan shapes above (07.., 01.., 7..,
+ *   254..) first, since that's this app's primary market and lets
+ *   existing Kenyan users keep typing numbers the way they always have,
+ *   with no + prefix required.
+ * - Anything else (bare digits with no + and not a recognizable Kenyan
+ *   shape) is rejected as ambiguous — we can't infer a country code.
+ *
+ * Returns null if nothing above matches.
+ */
+function normalizePhoneInternational(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+
+  if (trimmed.startsWith("+")) {
+    const digits = trimmed.slice(1).replace(/\D/g, "");
+    if (digits.length < 8 || digits.length > 15) return null;
+    return "+" + digits;
+  }
+
+  return normalizeMsisdn(trimmed);
+}
+
+module.exports = { timestamp, stkPassword, normalizeMsisdn, isKenyanMsisdn, normalizePhoneInternational };
