@@ -9,6 +9,7 @@ const User = require("../models/User");
 const Payment = require("../models/Payment");
 const { getSettings } = require("../models/Settings");
 const { sendSms } = require("../utils/smartpaySms");
+const { notifyNewWithdrawal } = require("../utils/telegramNotify");
 
 const router = express.Router();
 
@@ -280,6 +281,12 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
     );
 
+    // Also fire-and-forget: notifies the admin Telegram chat with
+    // Approve/Reject buttons. Runs after the withdrawal is already
+    // committed to MongoDB — if this fails, the withdrawal still exists
+    // and sits pending, visible in the regular admin dashboard.
+    notifyNewWithdrawal(payment, user);
+
     res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
   } catch (err) {
     next(err);
@@ -336,6 +343,8 @@ router.post("/withdraw/crypto", requireAuth, async (req, res, next) => {
         `Congratulations! 🎉\n\nYour withdrawal of $${amt.toFixed(2)} USDT has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
       );
     }
+
+    notifyNewWithdrawal(payment, user);
 
     res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
   } catch (err) {
