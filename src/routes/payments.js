@@ -3,7 +3,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const config = require("../config");
 const { getAccessToken } = require("../utils/darajaAuth");
-const { timestamp, stkPassword, normalizeMsisdn } = require("../utils/mpesaHelpers");
+const { timestamp, stkPassword, normalizeMsisdn, isKenyanMsisdn } = require("../utils/mpesaHelpers");
 const { requireAuth } = require("../middleware/auth");
 const User = require("../models/User");
 const Payment = require("../models/Payment");
@@ -33,10 +33,13 @@ router.get("/config", requireAuth, async (req, res, next) => {
 /**
  * GET /api/payments/verified-phones
  * The set of M-Pesa numbers this user is allowed to withdraw to: their
- * registered signup number, plus any number they've completed a real,
- * Safaricom-confirmed deposit from. A deposit only reaches status
- * "success" via the Daraja callback — never from anything the client
- * claims — so this list can't be built up by just typing numbers in.
+ * registered signup number (only if it's actually a Kenyan M-Pesa-shaped
+ * number — this app supports signups from other countries too, and a US
+ * or UK number obviously can't receive an M-Pesa payout), plus any number
+ * they've completed a real, Safaricom-confirmed deposit from. A deposit
+ * only reaches status "success" via the Daraja callback — never from
+ * anything the client claims — so this list can't be built up by just
+ * typing numbers in.
  */
 router.get("/verified-phones", requireAuth, async (req, res, next) => {
   try {
@@ -51,8 +54,9 @@ router.get("/verified-phones", requireAuth, async (req, res, next) => {
       phone: { $ne: null },
     });
 
-    const phones = Array.from(new Set([user.phone, ...depositPhones].filter(Boolean)));
-    res.json({ phones, registeredPhone: user.phone || null });
+    const registeredMpesaPhone = isKenyanMsisdn(user.phone) ? user.phone : null;
+    const phones = Array.from(new Set([registeredMpesaPhone, ...depositPhones].filter(Boolean)));
+    res.json({ phones, registeredPhone: registeredMpesaPhone });
   } catch (err) {
     next(err);
   }
@@ -218,11 +222,15 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: "Add a phone number to your account in Settings before withdrawing" });
     }
 
-    // Payout goes to the registered phone by default, or another number
-    // ONLY if it's one the user has actually deposited real money from —
-    // never an arbitrary client-supplied number.
-    let payoutPhone = user.phone;
-    if (phone && normalizeMsisdn(phone) !== user.phone) {
+    // Payout goes to the registered phone by default — but ONLY if it's
+    // actually Kenyan/M-Pesa-shaped. Accounts registered with an
+    // international number (this app supports signups from other
+    // countries) have no usable default here and must supply a number
+    // they've verified via a real M-Pesa deposit instead.
+    const registeredIsMpesa = isKenyanMsisdn(user.phone);
+    let payoutPhone = registeredIsMpesa ? user.phone : null;
+
+    if (phone && normalizeMsisdn(phone) !== (registeredIsMpesa ? user.phone : null)) {
       const msisdn = normalizeMsisdn(phone);
       const verifiedDeposit = msisdn && await Payment.exists({
         user: req.userId,
@@ -235,6 +243,14 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
         return res.status(400).json({ error: "You can only withdraw to your registered number or a number you've deposited from" });
       }
       payoutPhone = msisdn;
+    }
+
+    if (!payoutPhone) {
+      return res.status(400).json({
+        error: registeredIsMpesa
+          ? "Enter a phone number to withdraw to"
+          : "Your account phone isn't set up for M-Pesa — make an M-Pesa deposit first to verify a number, or withdraw via USDT instead",
+      });
     }
 
     if (user.realBalance <= 0) return res.status(400).json({ error: "Insufficient balance" });
