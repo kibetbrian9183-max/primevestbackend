@@ -17,17 +17,25 @@ const paymentSchema = new mongoose.Schema(
     txHash: { type: String, default: "" }, // optional — user-supplied TRC20 transaction hash for a deposit
 
     // deposits: pending -> success | failed (set by the Daraja callback)
-    // withdrawals: pending -> completed | rejected (set manually by an admin)
+    // withdrawals: pending -> approved -> completed, or pending/approved -> rejected.
+    // "approved" means an admin signed off but the payout hasn't been
+    // confirmed sent yet — "completed" is the only status that means money
+    // actually left. Set manually by an admin, via the REST admin routes
+    // or the Telegram bot — both paths go through the same service
+    // functions (services/withdrawalActions.js), so there's exactly one
+    // implementation of these transitions, not two competing ones.
     status: {
       type: String,
-      enum: ["pending", "success", "completed", "failed", "rejected"],
+      enum: ["pending", "approved", "success", "completed", "failed", "rejected"],
       default: "pending",
       index: true,
     },
 
-    processedByAdmin: { type: String, default: null }, // admin email
+    processedByAdmin: { type: String, default: null }, // admin email, or "telegram:<id>" for bot-originated actions
     processedAt: { type: Date },
+    paidAt: { type: Date }, // set only when status becomes "completed"
     adminNote: { type: String, default: "" },
+    telegramMessageId: { type: Number, default: null }, // the notification message in the admin chat, so approve/reject/paid can edit it in place
   },
   { timestamps: true }
 );
