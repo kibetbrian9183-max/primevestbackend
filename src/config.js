@@ -16,16 +16,9 @@ module.exports = {
   isProduction: env === "production",
   port: Number(process.env.PORT || 10000),
 
-  daraja: {
-    baseUrl:
-      env === "production"
-        ? "https://api.safaricom.co.ke"
-        : "https://sandbox.safaricom.co.ke",
-    consumerKey: required("MPESA_CONSUMER_KEY"),
-    consumerSecret: required("MPESA_CONSUMER_SECRET"),
-    shortcode: required("MPESA_SHORTCODE"),
-    passkey: required("MPESA_PASSKEY"),
-    stkCallbackUrl: required("MPESA_STK_CALLBACK_URL"),
+  smartpay: {
+    baseUrl: "https://api.smartpaypesa.com/v1",
+    apiKey: required("SMARTPAY_API_KEY"),
   },
 
   // The single wallet address deposits are shown to send USDT to. Crypto
