@@ -2,8 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
 const config = require("../config");
-const { getAccessToken } = require("../utils/darajaAuth");
-const { timestamp, stkPassword, normalizeMsisdn, isKenyanMsisdn } = require("../utils/mpesaHelpers");
+const { normalizeMsisdn, isKenyanMsisdn } = require("../utils/mpesaHelpers");
 const { requireAuth } = require("../middleware/auth");
 const User = require("../models/User");
 const Payment = require("../models/Payment");
@@ -37,8 +36,8 @@ router.get("/config", requireAuth, async (req, res, next) => {
  * registered signup number (only if it's actually a Kenyan M-Pesa-shaped
  * number — this app supports signups from other countries too, and a US
  * or UK number obviously can't receive an M-Pesa payout), plus any number
- * they've completed a real, Safaricom-confirmed deposit from. A deposit
- * only reaches status "success" via the Daraja callback — never from
+ * they've completed a real, SmartPay-confirmed deposit from. A deposit
+ * only reaches status "success" via the SmartPay callback — never from
  * anything the client claims — so this list can't be built up by just
  * typing numbers in.
  */
@@ -66,10 +65,10 @@ router.get("/verified-phones", requireAuth, async (req, res, next) => {
 /**
  * POST /api/payments/deposit
  * Body: { phone, amountKes }
- * Starts a real M-Pesa STK push and records a pending Payment. The
- * actual balance credit happens in the callback once Safaricom
- * confirms the payment — never here, and never based on anything the
- * client claims succeeded.
+ * Starts a real M-Pesa STK push via SmartPay and records a pending
+ * Payment. The actual balance credit happens in the callback once
+ * SmartPay confirms the payment — never here, and never based on
+ * anything the client claims succeeded.
  */
 router.post("/deposit", requireAuth, async (req, res, next) => {
   try {
@@ -83,26 +82,20 @@ router.post("/deposit", requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: `Minimum deposit is KES ${settings.minDepositKes}` });
     }
 
-    const token = await getAccessToken();
-    const ts = timestamp();
-
     const { data } = await axios.post(
-      `${config.daraja.baseUrl}/mpesa/stkpush/v1/processrequest`,
+      `${config.smartpay.baseUrl}/stk/push`,
       {
-        BusinessShortCode: config.daraja.shortcode,
-        Password: stkPassword(ts),
-        Timestamp: ts,
-        TransactionType: "CustomerPayBillOnline",
-        Amount: amt,
-        PartyA: msisdn,
-        PartyB: config.daraja.shortcode,
-        PhoneNumber: msisdn,
-        CallBackURL: config.daraja.stkCallbackUrl,
-        AccountReference: "PrimeVest",
-        TransactionDesc: "PrimeVest deposit",
+        phone: msisdn,
+        amount: amt,
+        account_reference: "PrimeVest",
+        description: "PrimeVest deposit",
       },
-      { headers: { Authorization: `Bearer ${token}` } }
+      { headers: { Authorization: `Bearer ${config.smartpay.apiKey}` } }
     );
+
+    if (!data.success) {
+      return res.status(502).json({ error: data.message || "Payment provider rejected the request" });
+    }
 
     const usdAmount = Number((amt / settings.usdKesRate).toFixed(2));
 
@@ -112,17 +105,17 @@ router.post("/deposit", requireAuth, async (req, res, next) => {
       amountKes: amt,
       usdAmount,
       phone: msisdn,
-      reference: data.CheckoutRequestID,
+      reference: data.checkout_request_id,
       status: "pending",
     });
 
-    res.json({ checkoutRequestId: data.CheckoutRequestID, customerMessage: data.CustomerMessage });
+    res.json({ checkoutRequestId: data.checkout_request_id, customerMessage: data.message });
   } catch (err) {
     next(err);
   }
 });
 
-/** Called by Safaricom — not the frontend. See stk.js history for IP-allowlist notes. */
+/** Called by SmartPay — not the frontend. Consider restricting to SmartPay's published IP ranges. */
 router.post("/deposit/callback", async (req, res) => {
   const body = req.body?.Body?.stkCallback;
   if (!body) return res.status(400).json({ ResultCode: 1, ResultDesc: "Bad payload" });
@@ -137,9 +130,11 @@ router.post("/deposit/callback", async (req, res) => {
     payment.mpesaReceiptNumber = items.MpesaReceiptNumber;
     await payment.save();
 
-    // Credit the user's Real account now that Safaricom has actually confirmed payment.
+    // Credit the user's Real account now that SmartPay has actually confirmed payment.
     await User.findByIdAndUpdate(payment.user, { $inc: { realBalance: payment.usdAmount } });
   } else {
+    // Common non-zero codes: 1032 (cancelled by user), 1037 (timeout,
+    // unreachable), 9999 (general error while sending push).
     payment.status = "failed";
     payment.adminNote = ResultDesc;
     await payment.save();
