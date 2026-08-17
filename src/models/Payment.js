@@ -16,17 +16,24 @@ const paymentSchema = new mongoose.Schema(
     mpesaReceiptNumber: { type: String },
     txHash: { type: String, default: "" }, // optional — user-supplied TRC20 transaction hash for a deposit
 
-    // deposits: pending -> success | failed (set by the Daraja callback)
-    // withdrawals: pending -> approved -> completed, or pending/approved -> rejected.
-    // "approved" means an admin signed off but the payout hasn't been
-    // confirmed sent yet — "completed" is the only status that means money
-    // actually left. Set manually by an admin, via the REST admin routes
-    // or the Telegram bot — both paths go through the same service
-    // functions (services/withdrawalActions.js), so there's exactly one
-    // implementation of these transitions, not two competing ones.
+    // SmartPay's own B2C reference (distinct from `reference` above) —
+    // needed to poll GET /v1/b2c/{ref} for the payout's real outcome,
+    // since B2C results aren't delivered via webhook.
+    payoutRef: { type: String, default: null },
+    fee: { type: Number, default: 0 }, // KES fee SmartPay deducted for a B2C payout
+
+    // deposits: pending -> success | failed (set by the SmartPay STK callback)
+    // withdrawals (mpesa): pending -> processing -> completed, or
+    // pending/processing -> rejected (balance auto-refunded on failure —
+    // see routes/payments.js). Sent automatically via SmartPay B2C, no
+    // admin approval step.
+    // withdrawals (usdt_trc20): pending -> approved -> completed, or
+    // pending/approved -> rejected. Still manual — set by an admin via the
+    // REST admin routes or the Telegram bot, both going through the same
+    // service functions (services/withdrawalActions.js).
     status: {
       type: String,
-      enum: ["pending", "approved", "success", "completed", "failed", "rejected"],
+      enum: ["pending", "processing", "approved", "success", "completed", "failed", "rejected"],
       default: "pending",
       index: true,
     },
