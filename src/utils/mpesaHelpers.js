@@ -1,29 +1,6 @@
-const config = require("../config");
-
-/** Safaricom's required timestamp format: yyyyMMddHHmmss */
-function timestamp() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return (
-    d.getFullYear().toString() +
-    pad(d.getMonth() + 1) +
-    pad(d.getDate()) +
-    pad(d.getHours()) +
-    pad(d.getMinutes()) +
-    pad(d.getSeconds())
-  );
-}
-
-/** Password for Lipa Na M-Pesa Online = base64(shortcode + passkey + timestamp) */
-function stkPassword(ts) {
-  return Buffer.from(`${config.daraja.shortcode}${config.daraja.passkey}${ts}`).toString(
-    "base64"
-  );
-}
-
 /**
- * Normalizes a Kenyan phone number to Safaricom's expected 2547XXXXXXXX /
- * 2541XXXXXXXX format. Accepts 07.., 01.., 7.., 254.. inputs.
+ * Normalizes a Kenyan phone number to the 2547XXXXXXXX / 2541XXXXXXXX
+ * format SmartPay/M-Pesa expect. Accepts 07.., 01.., 7.., 254.. inputs.
  * Returns null if the number doesn't look valid.
  */
 function normalizeMsisdn(raw) {
@@ -71,4 +48,4 @@ function normalizePhoneInternational(raw) {
   return normalizeMsisdn(trimmed);
 }
 
-module.exports = { timestamp, stkPassword, normalizeMsisdn, isKenyanMsisdn, normalizePhoneInternational };
+module.exports = { normalizeMsisdn, isKenyanMsisdn, normalizePhoneInternational };
