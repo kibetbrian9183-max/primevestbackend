@@ -3,6 +3,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const config = require("../config");
 const { normalizeMsisdn, isKenyanMsisdn } = require("../utils/mpesaHelpers");
+const { sendPayout, getPayoutStatus } = require("../utils/smartpayB2c");
 const { requireAuth } = require("../middleware/auth");
 const User = require("../models/User");
 const Payment = require("../models/Payment");
@@ -14,6 +15,29 @@ const router = express.Router();
 
 // Basic TRC20 (Tron) address shape check — starts with T, 34 base58 chars.
 const TRC20_ADDRESS_RE = /^T[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+// Maps SmartPay's B2C status values onto our own Payment.status enum.
+const B2C_STATUS_MAP = {
+  PROCESSING: "processing",
+  COMPLETED: "completed",
+  FAILED: "rejected",
+  TIMED_OUT: "rejected",
+  REVERSED: "rejected",
+};
+
+/**
+ * Refunds a failed/timed-out/reversed withdrawal back onto the user's
+ * balance and records the final state. SmartPay already reverses the
+ * amount+fee in ITS wallet automatically — this mirrors that on our side,
+ * since our balance was deducted independently at request time.
+ */
+async function refundAndReject(payment, note) {
+  await User.findByIdAndUpdate(payment.user, { $inc: { realBalance: payment.usdAmount } });
+  payment.status = "rejected";
+  payment.adminNote = note;
+  payment.processedAt = new Date();
+  await payment.save();
+}
 
 /** Public config the deposit/withdraw screens need — the receiving address and current rates. */
 router.get("/config", requireAuth, async (req, res, next) => {
@@ -160,7 +184,7 @@ router.get("/deposit/status/:reference", requireAuth, async (req, res, next) => 
  * Records a pending deposit against our fixed USDT (TRC20) address. We
  * don't watch the chain, so this doesn't credit anything by itself — an
  * admin confirms it manually once they see the funds land, same idea as
- * a manually-disbursed M-Pesa withdrawal but in reverse.
+ * a manually-disbursed crypto withdrawal but in reverse.
  */
 router.post("/deposit/crypto", requireAuth, async (req, res, next) => {
   try {
@@ -194,13 +218,18 @@ router.post("/deposit/crypto", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/payments/withdraw
- * Body: { amountUsd }
- * Payouts always go to the phone number the user registered at signup —
- * never a client-supplied number — so a compromised session can't be used
- * to redirect a withdrawal to an attacker's own M-Pesa line.
- * No live B2C payout is wired up — this validates against the real
- * balance, deducts it immediately, and records a pending withdrawal
- * for an admin to disburse manually and mark paid.
+ * Body: { amountUsd, phone? }
+ * Payouts always go to the phone number the user registered at signup, or
+ * a number they've verified via a real deposit — never an arbitrary
+ * client-supplied number — so a compromised session can't redirect a
+ * withdrawal to an attacker's own M-Pesa line.
+ *
+ * Fully automatic: balance is deducted, then the payout is sent to
+ * SmartPay B2C immediately — no admin approval step. If SmartPay's send
+ * call itself fails outright, the balance is restored and the request is
+ * rejected up front. If it's accepted but later fails/times out/reverses,
+ * that's caught by /withdraw/status polling (see below), which refunds
+ * the balance at that point instead.
  */
 router.post("/withdraw", requireAuth, async (req, res, next) => {
   try {
@@ -252,6 +281,8 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
     if (user.realBalance <= 0) return res.status(400).json({ error: "Insufficient balance" });
     if (amt > user.realBalance) return res.status(400).json({ error: "Insufficient balance for this amount" });
 
+    // Deduct up front, same as before — this is what makes the balance
+    // check above race-safe against a user double-submitting.
     user.realBalance = Number((user.realBalance - amt).toFixed(2));
     await user.save();
 
@@ -268,21 +299,79 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       status: "pending",
     });
 
-    // Fire-and-forget: confirm receipt immediately, before an admin has
-    // touched this. Never blocks or fails the withdrawal itself if the
-    // SMS gateway hiccups.
+    // Send the actual payout now. If SmartPay rejects the send outright
+    // (bad phone, insufficient wallet balance, gateway unreachable, etc.),
+    // refund immediately and tell the user — don't leave them thinking
+    // it's in flight.
+    let payout;
+    try {
+      payout = await sendPayout(payoutPhone, amountKes);
+    } catch (err) {
+      const errorCode = err.response?.data?.error_code;
+      const message = err.response?.data?.message || "Withdrawal could not be sent";
+      await refundAndReject(payment, `B2C send failed: ${errorCode || err.message}`);
+      return res.status(502).json({ error: message });
+    }
+
+    payment.payoutRef = payout.reference;
+    payment.fee = payout.fee || 0;
+    payment.status = B2C_STATUS_MAP[payout.status] || "processing";
+    await payment.save();
+
+    // Fire-and-forget: confirm receipt immediately. Never blocks or fails
+    // the withdrawal itself if the SMS gateway hiccups.
     sendSms(
       payoutPhone,
-      `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} has been successfully received and will be processed shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
+      `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} is on its way and should land shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
     );
 
-    // Also fire-and-forget: notifies the admin Telegram chat with
-    // Approve/Reject buttons. Runs after the withdrawal is already
-    // committed to MongoDB — if this fails, the withdrawal still exists
-    // and sits pending, visible in the regular admin dashboard.
+    // Fire-and-forget: lets the admin Telegram chat see it happened —
+    // informational only now, no Approve/Reject buttons needed since
+    // there's nothing left to approve.
     notifyNewWithdrawal(payment, user);
 
-    res.status(201).json({ reference: payment.reference, amountKes, balance: user.realBalance });
+    res.status(201).json({
+      reference: payment.reference,
+      amountKes,
+      balance: user.realBalance,
+      status: payment.status,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/payments/withdraw/status/:reference
+ * Polled by the frontend while a payout is "processing". Checks SmartPay
+ * for the real outcome (B2C results don't arrive via webhook) and
+ * updates + refunds as needed. Safe to call repeatedly — once the
+ * payment is no longer "processing" this just returns the stored status
+ * without hitting SmartPay again.
+ */
+router.get("/withdraw/status/:reference", requireAuth, async (req, res, next) => {
+  try {
+    const payment = await Payment.findOne({ reference: req.params.reference, user: req.userId });
+    if (!payment) return res.status(404).json({ status: "unknown" });
+
+    if (payment.status !== "processing" || !payment.payoutRef) {
+      return res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes });
+    }
+
+    const result = await getPayoutStatus(payment.payoutRef);
+    const mapped = B2C_STATUS_MAP[result.status] || "processing";
+
+    if (mapped === "completed") {
+      payment.status = "completed";
+      payment.paidAt = new Date();
+      payment.processedAt = new Date();
+      await payment.save();
+    } else if (mapped === "rejected") {
+      await refundAndReject(payment, result.response_description || `Payout ${result.status}`);
+    }
+    // else still "processing" — nothing to update yet.
+
+    res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes });
   } catch (err) {
     next(err);
   }
@@ -292,9 +381,10 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
  * POST /api/payments/withdraw/crypto
  * Body: { amountUsd, walletAddress }
  * Unlike M-Pesa withdrawals, the destination here is inherently
- * user-supplied (their own wallet) — there's no "registered address" to
- * pin it to. Same manual-review model otherwise: balance is deducted
- * immediately, an admin sends the actual payout and marks it paid.
+ * user-supplied (their own wallet) — SmartPay's B2C only pays out to
+ * M-Pesa, so there's no automated rail for this. Same manual-review model
+ * as before: balance is deducted immediately, an admin sends the actual
+ * payout and marks it paid.
  */
 router.post("/withdraw/crypto", requireAuth, async (req, res, next) => {
   try {
