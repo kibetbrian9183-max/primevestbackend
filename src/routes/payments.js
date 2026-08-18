@@ -3,7 +3,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const config = require("../config");
 const { normalizeMsisdn, isKenyanMsisdn } = require("../utils/mpesaHelpers");
-const { sendPayout, getPayoutStatus } = require("../utils/smartpayB2c");
+const { sendPayout, getPayoutStatus, calculateB2cFee } = require("../utils/smartpayB2c");
 const { requireAuth } = require("../middleware/auth");
 const User = require("../models/User");
 const Payment = require("../models/Payment");
@@ -281,40 +281,80 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
     if (user.realBalance <= 0) return res.status(400).json({ error: "Insufficient balance" });
     if (amt > user.realBalance) return res.status(400).json({ error: "Insufficient balance for this amount" });
 
+    // Fee comes off what the user receives, not what leaves their app
+    // balance — a 500 KES withdrawal with a 10 KES fee sends 490 KES to
+    // the phone, while the full 500 is still deducted below. That's what
+    // keeps this app's wallet whole against SmartPay's own B2C fee.
+    const grossAmountKes = Math.round(amt * settings.usdKesRate);
+    const fee = calculateB2cFee(grossAmountKes);
+    const netAmountKes = grossAmountKes - fee;
+    if (netAmountKes < 10) {
+      // SmartPay's B2C minimum is KSh 10 — nothing deducted yet, safe to just reject.
+      return res.status(400).json({ error: `Minimum withdrawal is $${settings.minWithdrawalUsd}` });
+    }
+
     // Deduct up front, same as before — this is what makes the balance
     // check above race-safe against a user double-submitting.
     user.realBalance = Number((user.realBalance - amt).toFixed(2));
     await user.save();
 
-    const amountKes = Math.round(amt * settings.usdKesRate);
     const reference = `WD-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 
     const payment = await Payment.create({
       user: user._id,
       type: "withdrawal",
-      amountKes,
-      usdAmount: amt,
+      amountKes: netAmountKes, // what actually gets sent to / received on the phone
+      usdAmount: amt, // what left the user's app balance (gross)
+      fee,
       phone: payoutPhone,
       reference,
       status: "pending",
     });
 
-    // Send the actual payout now. If SmartPay rejects the send outright
-    // (bad phone, insufficient wallet balance, gateway unreachable, etc.),
-    // refund immediately and tell the user — don't leave them thinking
-    // it's in flight.
+    // Send the actual payout now. Two very different failure shapes here:
+    //   - SmartPay responded WITH an error (bad phone, insufficient
+    //     wallet balance, validation, etc.) — the send definitely never
+    //     happened at their end, so it's safe to refund.
+    //   - We got no response at all (timeout, dropped connection) —
+    //     SmartPay may well have already dispatched the payout even
+    //     though we never heard back (this is exactly what happened
+    //     testing this: funds arrived instantly while our own request
+    //     hung waiting on a slow response). Refunding here would create
+    //     a double-spend — the user keeps the M-Pesa funds AND gets
+    //     their app balance back. So on an ambiguous timeout we do NOT
+    //     refund; the withdrawal stays "processing" for manual
+    //     reconciliation against SmartPay's transaction history.
     let payout;
     try {
-      payout = await sendPayout(payoutPhone, amountKes);
+      payout = await sendPayout(payoutPhone, netAmountKes);
     } catch (err) {
-      const errorCode = err.response?.data?.error_code;
-      const message = err.response?.data?.message || "Withdrawal could not be sent";
-      await refundAndReject(payment, `B2C send failed: ${errorCode || err.message}`);
-      return res.status(502).json({ error: message });
+      if (err.response) {
+        // SmartPay actually answered — and it was a rejection.
+        const errorCode = err.response.data?.error_code;
+        const message = err.response.data?.message || "Withdrawal could not be sent";
+        await refundAndReject(payment, `B2C send failed: ${errorCode || err.message}`);
+        return res.status(502).json({ error: message });
+      }
+
+      // No response — timeout, network error, or connection dropped.
+      // Outcome unknown. Leave balance deducted and the payment
+      // "processing" with no payoutRef (we never got SmartPay's
+      // reference), and tell an admin to check manually.
+      payment.status = "processing";
+      payment.adminNote = `B2C send had no response (${err.code || err.message}) — verify against SmartPay's dashboard before taking any action`;
+      await payment.save();
+      notifyNewWithdrawal(payment, user);
+      return res.status(201).json({
+        reference: payment.reference,
+        amountKes: netAmountKes,
+        feeKes: fee,
+        grossKes: grossAmountKes,
+        balance: user.realBalance,
+        status: "processing",
+      });
     }
 
     payment.payoutRef = payout.reference;
-    payment.fee = payout.fee || 0;
     payment.status = B2C_STATUS_MAP[payout.status] || "processing";
     await payment.save();
 
@@ -322,7 +362,7 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
     // the withdrawal itself if the SMS gateway hiccups.
     sendSms(
       payoutPhone,
-      `Congratulations! 🎉\n\nYour withdrawal of KSh ${amountKes.toLocaleString()} is on its way and should land shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
+      `Congratulations! 🎉\n\nYour withdrawal of KSh ${netAmountKes.toLocaleString()} (after a KSh ${fee} provider fee) is on its way and should land shortly.\n\nThank you for using PrimeVest. We appreciate your trust and continued support.\n\nPrimeVest Support Team`
     );
 
     // Fire-and-forget: lets the admin Telegram chat see it happened —
@@ -332,7 +372,9 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
 
     res.status(201).json({
       reference: payment.reference,
-      amountKes,
+      amountKes: netAmountKes,
+      feeKes: fee,
+      grossKes: grossAmountKes,
       balance: user.realBalance,
       status: payment.status,
     });
@@ -355,7 +397,7 @@ router.get("/withdraw/status/:reference", requireAuth, async (req, res, next) =>
     if (!payment) return res.status(404).json({ status: "unknown" });
 
     if (payment.status !== "processing" || !payment.payoutRef) {
-      return res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes });
+      return res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes, feeKes: payment.fee });
     }
 
     const result = await getPayoutStatus(payment.payoutRef);
@@ -371,7 +413,7 @@ router.get("/withdraw/status/:reference", requireAuth, async (req, res, next) =>
     }
     // else still "processing" — nothing to update yet.
 
-    res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes });
+    res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes, feeKes: payment.fee });
   } catch (err) {
     next(err);
   }
