@@ -29,6 +29,37 @@ function newWithdrawalKeyboard(reference) {
   ];
 }
 
+/**
+ * Sent instead of newWithdrawalMessage when SmartPay's B2C send call gave
+ * no response at all (timeout/dropped connection) — we genuinely don't
+ * know if the payout went out, so this can't be auto-approved/rejected.
+ * The admin checks SmartPay's own dashboard directly before tapping
+ * either button.
+ */
+function ambiguousWithdrawalMessage(payment, user) {
+  return [
+    "⚠️ WITHDRAWAL NEEDS MANUAL CHECK",
+    "",
+    `Withdrawal ID: ${payment.reference}`,
+    `User: ${user?.name || "—"} (${user?.email || "—"})`,
+    `Amount: KSh ${Number(payment.amountKes).toLocaleString()} ($${Number(payment.usdAmount).toFixed(2)})`,
+    destinationLine(payment),
+    "",
+    "SmartPay never confirmed this send — no response came back, so we don't know if it actually went out.",
+    "Check the SmartPay dashboard/wallet history for a matching debit, then tap below.",
+    "Status: PROCESSING (unconfirmed)",
+  ].join("\n");
+}
+
+function ambiguousWithdrawalKeyboard(reference) {
+  return [
+    [
+      { text: "💰 MARK PAID", callback_data: `wd_confirm_paid:${reference}` },
+      { text: "↩️ REFUND USER", callback_data: `wd_reject:${reference}` },
+    ],
+  ];
+}
+
 function approvedMessage(payment, user) {
   return [
     "✅ WITHDRAWAL APPROVED",
@@ -69,6 +100,8 @@ function completedMessage(payment, user) {
 module.exports = {
   newWithdrawalMessage,
   newWithdrawalKeyboard,
+  ambiguousWithdrawalMessage,
+  ambiguousWithdrawalKeyboard,
   approvedMessage,
   approvedKeyboard,
   rejectedMessage,
