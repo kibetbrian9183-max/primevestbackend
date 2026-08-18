@@ -58,9 +58,12 @@ async function approveWithdrawal(idOrRef, actor) {
 }
 
 /**
- * pending OR approved -> rejected, and refunds the user's Real balance —
- * reusing the exact same $inc pattern the existing REST route already
- * used, not a second balance mechanism.
+ * pending, approved, OR processing -> rejected, and refunds the user's
+ * Real balance. "processing" is included alongside pending/approved
+ * because that's the state a withdrawal sits in after an ambiguous B2C
+ * timeout (see routes/payments.js) — if an admin checks SmartPay's
+ * dashboard and confirms the payout never actually went out, this is how
+ * they refund it from the same Telegram flow.
  */
 async function rejectWithdrawal(idOrRef, actor, note = "") {
   const existing = await Payment.findOne(findPaymentQuery(idOrRef));
@@ -69,7 +72,7 @@ async function rejectWithdrawal(idOrRef, actor, note = "") {
 
   const previousStatus = existing.status;
   const updated = await Payment.findOneAndUpdate(
-    { _id: existing._id, status: { $in: ["pending", "approved"] } },
+    { _id: existing._id, status: { $in: ["pending", "approved", "processing"] } },
     { $set: { status: "rejected", processedByAdmin: actor, processedAt: new Date(), adminNote: note || "Rejected by admin" } },
     { new: true }
   );
@@ -99,6 +102,33 @@ async function markWithdrawalPaid(idOrRef, actor) {
   if (!updated) throw new PaymentActionError("bad_transition", "This withdrawal must be approved before it can be marked paid");
 
   await log(updated, "mark_paid", "approved", actor);
+  return updated;
+}
+
+/**
+ * processing -> completed. A SEPARATE path from markWithdrawalPaid,
+ * used only for withdrawals stuck "processing" with no payoutRef because
+ * SmartPay's B2C send never returned a response (see routes/payments.js —
+ * we don't refund automatically in that case since the payout may have
+ * already gone out). An admin checks SmartPay's own dashboard/wallet
+ * history directly, confirms the debit actually happened, and only then
+ * calls this — it does NOT go through "approved" first, since there was
+ * never anything to approve; the send already happened (or didn't).
+ */
+async function confirmProcessingPaid(idOrRef, actor) {
+  const existing = await Payment.findOne(findPaymentQuery(idOrRef));
+  if (!existing) throw new PaymentActionError("not_found", "Withdrawal not found");
+  if (existing.type !== "withdrawal") throw new PaymentActionError("wrong_type", "Not a withdrawal");
+
+  const now = new Date();
+  const updated = await Payment.findOneAndUpdate(
+    { _id: existing._id, status: "processing" },
+    { $set: { status: "completed", processedByAdmin: actor, processedAt: now, paidAt: now } },
+    { new: true }
+  );
+  if (!updated) throw new PaymentActionError("bad_transition", "This withdrawal isn't waiting on manual confirmation");
+
+  await log(updated, "confirm_processing_paid", "processing", actor);
   return updated;
 }
 
@@ -150,6 +180,7 @@ module.exports = {
   approveWithdrawal,
   rejectWithdrawal,
   markWithdrawalPaid,
+  confirmProcessingPaid,
   confirmCryptoDeposit,
   rejectCryptoDeposit,
 };
