@@ -9,7 +9,7 @@ const User = require("../models/User");
 const Payment = require("../models/Payment");
 const { getSettings } = require("../models/Settings");
 const { sendSms } = require("../utils/smartpaySms");
-const { notifyNewWithdrawal } = require("../utils/telegramNotify");
+const { notifyNewWithdrawal, notifyAmbiguousWithdrawal } = require("../utils/telegramNotify");
 
 const router = express.Router();
 
@@ -343,7 +343,7 @@ router.post("/withdraw", requireAuth, async (req, res, next) => {
       payment.status = "processing";
       payment.adminNote = `B2C send had no response (${err.code || err.message}) — verify against SmartPay's dashboard before taking any action`;
       await payment.save();
-      notifyNewWithdrawal(payment, user);
+      notifyAmbiguousWithdrawal(payment, user);
       return res.status(201).json({
         reference: payment.reference,
         amountKes: netAmountKes,
