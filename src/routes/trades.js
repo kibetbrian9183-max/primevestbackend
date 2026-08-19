@@ -18,16 +18,38 @@ function evaluateWin(side, digit, resultDigit) {
 }
 
 /**
- * Looks up a per-instrument, per-side payout rate override. Falls back
- * to the global Settings.payoutRate for any (symbolId, side) combo an
- * admin hasn't explicitly configured — so unconfigured instruments keep
- * working exactly as before PayoutRate existed.
+ * Baseline payout multipliers by side, used whenever an admin hasn't set
+ * an explicit per-instrument PayoutRate override. These exist because a
+ * single flat Settings.payoutRate genuinely can't be correct for both
+ * "matches" and "differs" — matching one specific digit is a 1-in-10 shot
+ * (resultDigit === digit), while differing from it is 9-in-10 — so a fair
+ * (or house-edged) rate for one is never a fair rate for the other. Without
+ * this, every side pays out identically regardless of its actual odds,
+ * which is what was happening before this existed.
+ *
+ * "over"/"under" are deliberately excluded — their odds depend on which
+ * digit threshold the user picked (over 7 is a very different bet than
+ * over 2), so no single default is honest for them; they keep falling
+ * back to Settings.payoutRate until given the same digit-aware treatment.
+ */
+const DEFAULT_SIDE_RATES = {
+  matches: 9.5, // 850% profit — 1-in-10 odds (adjust via Telegram: /setrate <symbol> matches <percent>)
+  differs: 1.056, // 5.6% profit — 9-in-10 odds
+  even: 1.95, // ~50/50 odds
+  odd: 1.95,
+};
+
+/**
+ * Looks up a per-instrument, per-side payout rate override. Falls back to
+ * DEFAULT_SIDE_RATES (a sensible odds-based default per side) and, for
+ * anything not covered there, to the global Settings.payoutRate.
  */
 async function resolvePayoutRate(symbolId, side, settings) {
   if (symbolId) {
     const override = await PayoutRate.findOne({ symbolId, side });
     if (override) return override.rate;
   }
+  if (DEFAULT_SIDE_RATES[side] !== undefined) return DEFAULT_SIDE_RATES[side];
   return settings.payoutRate;
 }
 
@@ -51,7 +73,7 @@ router.get("/payout-rates", requireAuth, async (req, res, next) => {
       bySymbol[o.symbolId][o.side] = o.rate;
     }
 
-    res.json({ defaultRate: settings.payoutRate, rates: bySymbol });
+    res.json({ defaultRate: settings.payoutRate, sideDefaults: DEFAULT_SIDE_RATES, rates: bySymbol });
   } catch (err) {
     next(err);
   }
