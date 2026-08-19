@@ -1,6 +1,7 @@
 const express = require("express");
 const User = require("../models/User");
 const Trade = require("../models/Trade");
+const PayoutRate = require("../models/PayoutRate");
 const { requireAuth } = require("../middleware/auth");
 const { getSettings } = require("../models/Settings");
 
@@ -17,13 +18,53 @@ function evaluateWin(side, digit, resultDigit) {
 }
 
 /**
+ * Looks up a per-instrument, per-side payout rate override. Falls back
+ * to the global Settings.payoutRate for any (symbolId, side) combo an
+ * admin hasn't explicitly configured — so unconfigured instruments keep
+ * working exactly as before PayoutRate existed.
+ */
+async function resolvePayoutRate(symbolId, side, settings) {
+  if (symbolId) {
+    const override = await PayoutRate.findOne({ symbolId, side });
+    if (override) return override.rate;
+  }
+  return settings.payoutRate;
+}
+
+/**
+ * GET /api/trades/payout-rates
+ * Public (logged-in-user) read access to current rates, keyed by
+ * symbolId+side — e.g. { vol10: { matches: 1.95, differs: 1.056 } }.
+ * This is what the trade screen's live payout preview should call
+ * instead of using a hardcoded constant, so admin-configured rates are
+ * actually visible to a user BEFORE they commit a stake, not just
+ * reflected in what they're paid after the fact.
+ */
+router.get("/payout-rates", requireAuth, async (req, res, next) => {
+  try {
+    const settings = await getSettings();
+    const overrides = await PayoutRate.find();
+
+    const bySymbol = {};
+    for (const o of overrides) {
+      if (!bySymbol[o.symbolId]) bySymbol[o.symbolId] = {};
+      bySymbol[o.symbolId][o.side] = o.rate;
+    }
+
+    res.json({ defaultRate: settings.payoutRate, rates: bySymbol });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/trades
  * Opens a trade: validates + deducts the stake server-side so a client
  * can't spoof its own balance, then returns the trade id to resolve later.
  */
 router.post("/", requireAuth, async (req, res, next) => {
   try {
-    const { accountType, symbolLabel, market, marketLabel, side, sideLabel, digit, stake } = req.body || {};
+    const { accountType, symbolLabel, symbolId, market, marketLabel, side, sideLabel, digit, stake } = req.body || {};
     const stakeAmt = Number(stake);
 
     if (!["demo", "real"].includes(accountType)) return res.status(400).json({ error: "Invalid account type" });
@@ -36,7 +77,8 @@ router.post("/", requireAuth, async (req, res, next) => {
     if (user[balanceField] < stakeAmt) return res.status(400).json({ error: "Insufficient balance" });
 
     const settings = await getSettings();
-    const payout = Number((stakeAmt * settings.payoutRate).toFixed(2));
+    const rate = await resolvePayoutRate(symbolId, side, settings);
+    const payout = Number((stakeAmt * rate).toFixed(2));
 
     user[balanceField] = Number((user[balanceField] - stakeAmt).toFixed(2));
     await user.save();
@@ -45,6 +87,7 @@ router.post("/", requireAuth, async (req, res, next) => {
       user: user._id,
       accountType,
       symbolLabel,
+      symbolId,
       market,
       marketLabel,
       side,
@@ -55,7 +98,7 @@ router.post("/", requireAuth, async (req, res, next) => {
       status: "open",
     });
 
-    res.status(201).json({ tradeId: trade._id, balance: user[balanceField] });
+    res.status(201).json({ tradeId: trade._id, balance: user[balanceField], payout });
   } catch (err) {
     next(err);
   }
