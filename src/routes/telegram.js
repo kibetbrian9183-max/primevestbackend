@@ -68,7 +68,7 @@ async function formatRatesList() {
   lines.push(`  over/under: ${((settings.payoutRate - 1) * 100).toFixed(1)}% — from global settings (rate ${settings.payoutRate})`);
   lines.push("");
   lines.push("Commands:");
-  lines.push("/setrate <symbol> <side> <percent> — e.g. /setrate vol10 matches 950");
+  lines.push("/setrate <symbol|all> <side> <percent> — e.g. /setrate vol10 matches 950, or /setrate all even 95");
   lines.push("/delrate <symbol> <side> — remove an override");
   lines.push(`Symbols: ${VALID_SYMBOLS.join(", ")}`);
   lines.push(`Sides: ${VALID_SIDES.join(", ")}`);
@@ -89,9 +89,14 @@ async function handleTextCommand(text, senderId) {
 
   const setMatch = /^\/setrate\s+(\S+)\s+(\S+)\s+(-?\d+(\.\d+)?)$/i.exec(trimmed);
   if (setMatch) {
-    const [, symbolId, side, percentStr] = setMatch;
-    if (!VALID_SYMBOLS.includes(symbolId)) {
-      return `⚠️ Unknown symbol "${symbolId}". Valid: ${VALID_SYMBOLS.join(", ")}`;
+    const [, symbolArg, side, percentStr] = setMatch;
+    // "all" applies the same rate to every instrument in one command —
+    // e.g. /setrate all even 95 instead of five separate commands, one
+    // per volatility index.
+    const symbolIds = symbolArg.toLowerCase() === "all" ? VALID_SYMBOLS : [symbolArg];
+    const badSymbol = symbolIds.find((s) => !VALID_SYMBOLS.includes(s));
+    if (badSymbol) {
+      return `⚠️ Unknown symbol "${badSymbol}". Valid: ${VALID_SYMBOLS.join(", ")}, or "all"`;
     }
     if (!VALID_SIDES.includes(side)) {
       return `⚠️ Unknown side "${side}". Valid: ${VALID_SIDES.join(", ")}`;
@@ -102,23 +107,47 @@ async function handleTextCommand(text, senderId) {
       return "⚠️ Percent must be a positive number (e.g. 950 for a 950% payout).";
     }
 
-    await PayoutRate.findOneAndUpdate(
-      { symbolId, side },
-      { $set: { rate, updatedByAdmin: `telegram:${senderId}` } },
-      { upsert: true }
+    await Promise.all(
+      symbolIds.map((symbolId) =>
+        PayoutRate.findOneAndUpdate(
+          { symbolId, side },
+          { $set: { rate, updatedByAdmin: `telegram:${senderId}` } },
+          { upsert: true }
+        )
+      )
     );
-    return `✅ ${symbolId} / ${side} set to ${percent}% (rate ${rate.toFixed(4)})`;
+    return symbolIds.length > 1
+      ? `✅ ${side} set to ${percent}% (rate ${rate.toFixed(4)}) across all instruments: ${symbolIds.join(", ")}`
+      : `✅ ${symbolIds[0]} / ${side} set to ${percent}% (rate ${rate.toFixed(4)})`;
   }
 
   const delMatch = /^\/delrate\s+(\S+)\s+(\S+)$/i.exec(trimmed);
   if (delMatch) {
-    const [, symbolId, side] = delMatch;
-    const deleted = await PayoutRate.findOneAndDelete({ symbolId, side });
-    if (!deleted) return `⚠️ No override found for ${symbolId} / ${side} — nothing to delete.`;
-    return `✅ Removed override for ${symbolId} / ${side}. It now falls back to the side default.`;
+    const [, symbolArg, side] = delMatch;
+    const symbolIds = symbolArg.toLowerCase() === "all" ? VALID_SYMBOLS : [symbolArg];
+    const results = await Promise.all(symbolIds.map((symbolId) => PayoutRate.findOneAndDelete({ symbolId, side })));
+    const removed = symbolIds.filter((_, i) => results[i]);
+    if (removed.length === 0) return `⚠️ No override found for ${side} on ${symbolIds.join(", ")} — nothing to delete.`;
+    return `✅ Removed override for ${side} on: ${removed.join(", ")}. Falls back to the side default now.`;
   }
 
-  return null; // not a recognized command — caller decides what to do
+  // Anything that LOOKS like an attempted command (starts with "/") gets
+  // clear feedback instead of silent nothing — a typo'd command should
+  // never look identical to "the bot is broken". Plain conversational
+  // text (not starting with "/") is still ignored below, so the bot
+  // doesn't reply to every random message in the chat.
+  if (trimmed.startsWith("/")) {
+    return [
+      `⚠️ Unrecognized command: "${trimmed}"`,
+      "",
+      "Available commands:",
+      "/rates — view current payout rates",
+      "/setrate <symbol|all> <side> <percent> — e.g. /setrate vol10 matches 950, or /setrate all even 95",
+      "/delrate <symbol|all> <side> — remove an override",
+    ].join("\n");
+  }
+
+  return null; // not a command at all — nothing to reply to
 }
 
 /**
