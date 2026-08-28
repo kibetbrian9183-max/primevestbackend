@@ -168,10 +168,52 @@ router.post("/deposit/callback", async (req, res) => {
 });
 
 /** Polled by the frontend while showing "Check your phone". */
+/**
+ * Actively re-asks SmartPay about a still-pending deposit instead of only
+ * trusting the webhook. Exists because the webhook is a single delivery
+ * attempt — if it's ever misconfigured (wrong callback URL, momentary
+ * downtime) or SmartPay's retries exhaust, a deposit can sit "pending"
+ * in our DB forever with no way to resolve except a manual database
+ * edit. This lets it self-heal instead, the same way withdraw/status
+ * already does for B2C payouts.
+ */
+async function checkDepositStatus(checkoutRequestId) {
+  const { data } = await axios.get(
+    `${config.smartpay.baseUrl}/transactions/${encodeURIComponent(checkoutRequestId)}`,
+    { headers: { Authorization: `Bearer ${config.smartpay.apiKey}` }, timeout: 15000 }
+  );
+  return data; // { success, status: "pending" | "completed" | "failed", ... }
+}
+
 router.get("/deposit/status/:reference", requireAuth, async (req, res, next) => {
   try {
     const payment = await Payment.findOne({ reference: req.params.reference, user: req.userId });
     if (!payment) return res.status(404).json({ status: "unknown" });
+
+    if (payment.status === "pending") {
+      try {
+        const result = await checkDepositStatus(payment.reference);
+        if (result.status === "completed") {
+          payment.status = "success";
+          if (result.mpesa_receipt || result.receipt) {
+            payment.mpesaReceiptNumber = result.mpesa_receipt || result.receipt;
+          }
+          await payment.save();
+          await User.findByIdAndUpdate(payment.user, { $inc: { realBalance: payment.usdAmount } });
+        } else if (result.status === "failed") {
+          payment.status = "failed";
+          payment.adminNote = "Reconciled as failed via GET /transactions (webhook never confirmed)";
+          await payment.save();
+        }
+        // "pending" from SmartPay's side too — genuinely still in flight, leave as-is.
+      } catch (reconcileErr) {
+        // Reconciliation failing (network hiccup, SmartPay down) should
+        // never break the status check itself — just fall through and
+        // report whatever's currently stored.
+        console.error("[deposit reconcile] failed for", payment.reference, reconcileErr.message);
+      }
+    }
+
     res.json({ status: payment.status, usdAmount: payment.usdAmount, amountKes: payment.amountKes });
   } catch (err) {
     next(err);
